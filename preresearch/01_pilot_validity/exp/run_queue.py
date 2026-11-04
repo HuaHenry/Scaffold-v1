@@ -1,8 +1,8 @@
 """Multi-GPU job queue (plan 00 section 11).
 
-python -m exp.run_queue --jobs exp/jobs/pilot_validity_steps6000.json --gpus 0,1,2,3 --eval-after
-`out` in a job file is a result folder relative to the results root (experiments/preresearch/), timestamp included;
-re-running the SAME job file resumes (finished folders are skipped), a new `make_jobs --new` starts fresh folders.
+python -m exp.run_queue --jobs <run>/jobs/pilot_validity_steps6000.json --gpus 0,1,2,3 --eval-after
+`out` in a job file is a result folder relative to the results root (experiments/preresearch/), inside the run folder;
+re-running the SAME job file resumes (finished folders are skipped); a new run (new FW_RUN) has its own job files.
 Each GPU runs one job at a time (CUDA_VISIBLE_DEVICES). `--gpus cpu` (or cpu,cpu) runs on CPU for smoke tests.
 A job with out/done.json is skipped; a failure writes out/failed.json and the queue continues.
 """

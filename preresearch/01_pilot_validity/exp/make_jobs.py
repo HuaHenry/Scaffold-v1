@@ -4,10 +4,10 @@ python -m exp.make_jobs pilot_validity     # 12 training tasks of experiment 01
 python -m exp.make_jobs pilot_compose      # 2 short runs for check E (formation share per batch)
 python -m exp.make_jobs tune               # 18 one-off tuning runs (plan 00 section 13, item 7)
 
-Every job gets its result folder NOW: <results root>/<experiment>/<timestamp>_train_<id>_<settings>/ (the timestamp is
-the moment the job list is created, shared by the whole batch). The job file is named after the experiment and the
-number of steps (exp/jobs/<experiment>_steps<N>.json). If it already exists it is reused as is, so re-running the queue
-resumes the same folders; pass --new to create fresh folders with a new timestamp.
+Every job gets its result folder NOW, inside the current run folder (see exp.new_run):
+<results root>/01_pilot_validity/<run>/<train|tune|compose>/<id>_<settings>/. The job list itself is stored in the run
+folder too: <run>/jobs/<experiment>_steps<N>.json. If it already exists it is reused as is, so re-running the queue
+resumes the same folders; a fresh run (new FW_RUN) gets fresh job lists and fresh folders automatically.
 """
 from __future__ import annotations
 
@@ -16,12 +16,11 @@ import itertools
 from pathlib import Path
 
 from . import common
-from .common import ROOT
 
 
 class Ctx:
-    def __init__(self, steps, data, ts, batch=256):
-        self.steps, self.data, self.ts, self.batch = steps, data, ts, batch
+    def __init__(self, steps, data, run, batch=256):
+        self.steps, self.data, self.run, self.batch = steps, data, run, batch
         self.dir = Path(data) if data else common.DEFAULT_DATA
         self.fz = common.frozen_defaults()
         try:
@@ -36,7 +35,7 @@ class Ctx:
         depth = self.fz["depth"] if depth is None else depth
         sett = common.train_settings(episodes or self.n_full, "video", steps, self.batch, lr, cw, depth,
                                      self.fz["unroll"])
-        out = f"{exp}/{common.result_name('train', rid, sett, self.ts)}"
+        out = f"{exp}/{self.run}/{common.category('train', rid)}/{common.item_name('train', rid, sett)}"
         cmd = ["python", "-m", "exp.train", "--condition", condition, "--seed", str(seed), "--protocol", "video",
                "--steps", str(steps), "--batch", str(self.batch), "--id", rid, "--exp", exp, "--out", out,
                "--lr", str(lr), "--change-weight", str(cw), "--depth", str(depth), "--unroll", str(self.fz["unroll"])]
@@ -70,15 +69,15 @@ def tune(c: Ctx):
     jobs = []
     for lr, w, depth in itertools.product((1e-4, 3e-4, 1e-3), (4, 8, 16), (6, 8)):
         rid = f"tune_state_lr{lr:g}_cw{w}_d{depth}"
-        jobs.append(c.job(common.COMMON_NAME, rid, "state", 0, lr=lr, cw=w, depth=depth))
+        jobs.append(c.job(common.EXP_NAME, rid, "state", 0, lr=lr, cw=w, depth=depth))
     return jobs
 
 
 EXPS = {"pilot_validity": pilot_validity, "pilot_compose": pilot_compose, "tune": tune}
 
 
-def job_file(experiment: str, steps: int) -> Path:
-    return ROOT / "exp" / "jobs" / f"{experiment}_steps{steps}.json"
+def job_file(experiment: str, steps: int, run: str | None = None) -> Path:
+    return common.RESULTS_ROOT / common.EXP_NAME / (run or common.current_run()) / "jobs" / f"{experiment}_steps{steps}.json"
 
 
 def main(argv=None):
@@ -86,16 +85,16 @@ def main(argv=None):
     ap.add_argument("experiment", choices=sorted(EXPS))
     ap.add_argument("--steps", type=int, default=6000, help="training steps (6000 = frozen protocol; lower for smoke tests)")
     ap.add_argument("--data", default=None, help="training data dir (default: game_code/output/data_v3)")
-    ap.add_argument("--new", action="store_true", help="overwrite an existing job file: new timestamp, new folders")
-    ap.add_argument("--out", type=Path, default=None, help="job file (default exp/jobs/<experiment>_steps<N>.json)")
+    ap.add_argument("--out", type=Path, default=None, help="job file (default <run>/jobs/<experiment>_steps<N>.json)")
     a = ap.parse_args(argv)
-    path = a.out or job_file(a.experiment, a.steps)
-    if path.exists() and not a.new:
-        print(f"{path} exists - reusing it (resumes the same result folders). Use --new for fresh folders.")
+    run = common.current_run()
+    path = a.out or job_file(a.experiment, a.steps, run)
+    if path.exists():
+        print(f"{common.rel(path)} exists - reusing it (resumes the same result folders).")
         return
-    jobs = EXPS[a.experiment](Ctx(a.steps, a.data, common.now_ts()))
+    jobs = EXPS[a.experiment](Ctx(a.steps, a.data, run))
     common.dump_json(jobs, path)
-    print(f"{len(jobs)} jobs -> {common.rel(path)}\nresult folders: <results>/{jobs[0]['out'].split('/')[0]}/{common.result_name('train', '<id>', '<settings>', jobs[0]['out'].split('/')[1][:15])}")
+    print(f"{len(jobs)} jobs -> {common.rel(path)}\nresult folders: {common.rel(common.RESULTS_ROOT / Path(jobs[0]['out']).parent)}/")
 
 
 if __name__ == "__main__":

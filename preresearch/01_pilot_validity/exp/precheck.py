@@ -118,10 +118,11 @@ def check_3(run: Path, bench_path: Path, device: str) -> dict:
 
 def check_4(run: Path) -> dict:
     ev = common.load_json(run / "eval.json")
-    bp = common.find_latest("apply_edit", "baseline", None, "eval.json",
-                            {"bench": common.bench_label(common.DEFAULT_BENCH), "splits": "all", "limit": None})
+    bp = common.find_latest("apply_edit", "baseline", common.EXP_NAME, "eval.json",
+                            {"bench": common.bench_label(common.DEFAULT_BENCH), "splits": "all", "limit": None},
+                            common.current_run(common.EXP_NAME, create=False))
     if bp is None:
-        return {"pass": None, "note": "run: python -m exp.evaluate --predictor apply_edit"}
+        return {"pass": None, "note": "run: python -m exp.evaluate --predictor apply_edit (in the same run)"}
     state = ev["by_split"]["id"]["cascade_f1"]["mean"]
     base = common.load_json(bp / "eval.json")["by_split"]["id"]["cascade_f1"]["mean"]
     status = "ok (> 0.3)" if state > 0.3 else ("weak (0.15-0.3)" if state >= 0.15 else "STOP (< 0.15): check loss weight, action encoding, lr")
@@ -146,13 +147,13 @@ def main(argv=None) -> int:
     ap.add_argument("--steps", type=int, default=6000, help="when --run is an id: training steps of the run to pick (0 = any)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--small", action="store_true", help="use a tiny model for items 2 and 5 (smoke test only)")
-    ap.add_argument("--out", type=Path, default=None, help="result folder (default: new timestamped folder in 00_common)")
+    ap.add_argument("--out", type=Path, default=None, help="result folder (default: <run>/precheck/<items>)")
     a = ap.parse_args(argv)
     items = {int(x) for x in a.items.split(",")}
     data, bench = resolve(a.data), resolve(a.bench)
     run = common.resolve_run(a.run, steps=a.steps) if items & {3, 4, 6} else None
     out_dir = common.resolve_out(a.out) if a.out else common.new_result_dir(
-        common.COMMON_NAME, "precheck", "items" + "-".join(map(str, sorted(items))),
+        common.EXP_NAME, "precheck", "items" + "-".join(map(str, sorted(items))),
         ("small_" if a.small else "") + (a.device if a.device != "auto" else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
     common.write_meta(out_dir, "precheck", "items" + "-".join(map(str, sorted(items))), {"items": sorted(items), "small": a.small,

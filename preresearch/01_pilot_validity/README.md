@@ -26,14 +26,14 @@ preresearch/01_pilot_validity/
     tests/test_pilot.py          18 个 pytest
 ```
 
-**所有运行结果都不写在本目录**，统一写到项目根目录下的 `experiments/preresearch/`（见第 9 节）；本目录只有代码和 `exp/jobs/`（任务清单）。
+**所有运行结果都不写在本目录**，统一写到项目根目录下的 `experiments/preresearch/`（见第 9 节）；本目录只有代码。一次运行的所有产物（检查、调参、训练、基线、分析、任务清单）都在 `experiments/preresearch/01_pilot_validity/<时间戳>/` 这一个大文件夹里。
 
 ## 2. 环境
 
 - 目标：Linux + 4×H200，Python ≥ 3.10，`torch ≥ 2.4`。
 - 在本目录安装：`pip install -r requirements.txt`。`numpy` 同时被 `game_code` 使用。
 - 需要 `game_code/output/data_v3/` 已存在（之前已生成）。如不在默认位置：`export FW_DATA=/path/to/data_v3`（也可用 `FW_GAME_CODE`、`FW_VAL` 覆盖）。
-- 之后所有命令都在 `preresearch/01_pilot_validity/` 下执行（`exp/jobs/` 等代码侧相对路径以此为基准）。结果根目录 `experiments/preresearch/` 可用 `export FW_RESULTS=/其他路径` 改。
+- 之后所有命令都在 `preresearch/01_pilot_validity/` 下执行。结果根目录 `experiments/preresearch/` 可用 `export FW_RESULTS=/其他路径` 改。
 
 ## 3. 一键运行
 
@@ -44,13 +44,19 @@ GPUS=0,1,2,3 bash run_all.sh                 # 完整流程，约 1–2 小时�
 RUN_TUNE=1 GPUS=0,1,2,3 bash run_all.sh      # 另外先做 00 §13 的一次性调参（18 组，30–60 分钟）
 ```
 
-`run_all.sh` 的步骤：pytest → 生成验证集 → 前置检查 1/2/5 → （可选）调参 → 4 个基线评测 → 检查 E 的短训练 → 12 个训练任务（带评测）→ 前置检查 3/4/6 → 分析。任何一步失败会停下（`set -e`），已完成的任务有 `done.json`，重跑会自动跳过。
+每执行一次 `bash run_all.sh` 就新建一个大文件夹 `experiments/preresearch/01_pilot_validity/<时间戳>/`（`LABEL=xxx` 可加后缀），本次的全部结果都在里面，旧的不动，重跑不会混。中断后续跑：`FW_RUN=<那个大文件夹名> bash run_all.sh`。
+
+`run_all.sh` 的步骤：pytest → 新建本次大文件夹 → 生成验证集 → 前置检查 1/2/5 → （可选）调参 → 4 个基线评测 → 检查 E 的短训练 → 12 个训练任务（带评测）→ 前置检查 3/4/6 → 分析。任何一步失败会停下（`set -e`），已完成的任务有 `done.json`，重跑会自动跳过。
 
 ## 4. 分步运行
 
 ```bash
 # 0. 测试
 python -m pytest -q
+
+# 0.5 选定本次运行的大文件夹（之后所有命令的输出都进这里；不设则用最新的那个大文件夹）
+export FW_RUN=$(python -m exp.new_run)        # 新建；想续跑旧的就 export FW_RUN=<旧文件夹名>
+RUN_DIR=$(python -m exp.new_run --path)
 
 # 1. 验证集（只用于训练时监控，不选模型）
 python -m exp.gen_val                         # -> game_code/output/data_val_v3
@@ -59,44 +65,45 @@ python -m exp.gen_val                         # -> game_code/output/data_val_v3
 python -m exp.precheck --items 1,2,5          # 编码往返与转移数、单 episode 过拟合、确定性
 python -m exp.precheck --items 3,4,6 --run state_s0   # 稳定性、击穿 apply_edit、漂移（需先训练 + 评测）
 
-# 3. 基线（每个基线新建一个 experiments/preresearch/01_pilot_validity/<时间戳>_baseline_<名称>_bench-data_v3/）
+# 3. 基线（每个基线新建 $RUN_DIR/baseline/<名称>_bench-data_v3/）
 for b in copy_last apply_edit random_physics oracle_reseed; do
   python -m exp.evaluate --predictor $b --workers 8
 done
 
 # 4. 检查 E（形成转移占比，两个 300 步短训练）
 python -m exp.make_jobs pilot_compose
-python -m exp.run_queue --jobs exp/jobs/pilot_compose_steps6000.json --gpus 0,1
+python -m exp.run_queue --jobs $RUN_DIR/jobs/pilot_compose_steps6000.json --gpus 0,1
 
 # 5. 12 个训练任务 + 评测
 python -m exp.make_jobs pilot_validity
-python -m exp.run_queue --jobs exp/jobs/pilot_validity_steps6000.json --gpus 0,1,2,3 --eval-after
+python -m exp.run_queue --jobs $RUN_DIR/jobs/pilot_validity_steps6000.json --gpus 0,1,2,3 --eval-after
 
-# 6. 分析
-python -m exp.analysis.pilot_validity          # 新建 <时间戳>_analysis_pilot_validity_... 目录
+# 6. 分析（只读本次大文件夹里的结果）
+python -m exp.analysis.pilot_validity          # 新建 $RUN_DIR/analysis/pilot_validity_... 目录
 ```
 
 常用选项：
 
-- 单个训练：`python -m exp.train --condition state --seed 0 [--episodes 64 --tag n64]   # 不给 --out 就自动新建带时间戳的结果目录`
+- 单个训练：`python -m exp.train --condition state --seed 0 [--episodes 64 --tag n64]   # 不给 --out 就在当前大文件夹的 train/ 下新建结果目录`
+- 冒烟测试用单独的大文件夹，免得和正式结果放一起：`export FW_RUN=$(python -m exp.new_run --label smoke)`
 - 单个评测：`python -m exp.evaluate --run state_s0 [--splits id,scale_ood] [--bench PATH] [--tag _b1]`（`--bench` 用于 MDE 在 0.04–0.08 时的第二份确认集）
-- 只看任务不运行：`python -m exp.run_queue --jobs exp/jobs/pilot_validity_steps6000.json --dry-run`
+- 只看任务不运行：`python -m exp.run_queue --jobs $RUN_DIR/jobs/pilot_validity_steps6000.json --dry-run`
 - 每个脚本都有 `--help`；失败返回非零码。
 
 ## 5. 12 个任务
 
-| 名称 | episode | 种子 | 结果目录（`experiments/preresearch/` 下） |
+| 名称 | episode | 种子 | 结果目录（`experiments/preresearch/01_pilot_validity/<本次大文件夹>/train/` 下） |
 | --- | --- | --- | --- |
-| `state_s0..s2` | 256 | 0,1,2 | `01_pilot_validity/<时间戳>_train_state_s{seed}_...`（与实验 03 共用，按 id 查找） |
-| `state_s3..s5` | 256 | 3,4,5 | `01_pilot_validity/<时间戳>_train_state_s{seed}_...` |
-| `state_n64_s0..s2` | 前 64 个 | 0,1,2 | `01_pilot_validity/<时间戳>_train_state_n{64,16}_s{seed}_...` |
-| `state_n16_s0..s2` | 前 16 个 | 0,1,2 | `01_pilot_validity/<时间戳>_train_state_n{64,16}_s{seed}_...` |
+| `state_s0..s2` | 256 | 0,1,2 | `state_s{seed}_ep256_...`（实验 03 可按 id 复用） |
+| `state_s3..s5` | 256 | 3,4,5 | `state_s{seed}_ep256_...` |
+| `state_n64_s0..s2` | 前 64 个 | 0,1,2 | `state_n64_s{seed}_ep64_...` |
+| `state_n16_s0..s2` | 前 16 个 | 0,1,2 | `state_n16_s{seed}_ep16_...` |
 
 全部为条件 `state`、协议 `video`、6000 步、batch 256。数据量不同则 epoch 数不同，这是有意的。
 
 ## 6. 怎么读结果
 
-打开最新的 `experiments/preresearch/01_pilot_validity/<时间戳>_analysis_pilot_validity_.../` 里的 `pilot_validity.md`（附录表 A1）和 `pilot_validity.json`：
+打开本次大文件夹里的 `experiments/preresearch/01_pilot_validity/<时间戳>/analysis/pilot_validity_.../` 的 `pilot_validity.md`（附录表 A1）和 `pilot_validity.json`：
 
 - **A 排序**：每个划分上 `copy_last`、`apply_edit`、`random_physics`、`state`、`oracle_reseed` 的均值与 95% CI。
 - **B 阳性对照**：`n256−n64`、`n64−n16`、`n256−n16` 的差值与 CI，以及“每翻倍多少个点”。
@@ -138,19 +145,25 @@ python -m exp.analysis.pilot_validity          # 新建 <时间戳>_analysis_pil
 
 ```
 experiments/preresearch/
-  00_common/                      前置检查、调参（各预实验共用）
-  01_pilot_validity/              本实验
-    20261104-173012_train_state_s0_ep256_video_steps6000_bs256_lr0.0003_cw8_d8/
-    20261104-173012_train_state_n16_s0_ep16_video_steps6000_bs256_lr0.0003_cw8_d8/
-    20261104-181530_baseline_copy_last_bench-data_v3/
-    20261104-190244_analysis_pilot_validity_steps6000_boot10000_cascade_f1/
+  01_pilot_validity/                      本实验
+    20261104-173012/                      <- 一次运行 = 一个大文件夹（run_all.sh 每执行一次新建一个）
+      run.json                            这次运行的登记（名称、创建时间、git 版本）
+      jobs/                               任务清单（pilot_validity_steps6000.json 等）
+      precheck/    items1-2-5_.../  items3-4-6_.../
+      tune/        tune_state_lr0.0003_cw8_d8_.../ ...  freeze_...（仅 RUN_TUNE=1 时有）
+      baseline/    copy_last_bench-data_v3/  apply_edit_.../  random_physics_.../  oracle_reseed_.../
+      compose/     compose_process_.../  compose_shuffle_.../   （检查 E 的短训练）
+      train/       state_s0_ep256_video_steps6000_bs256_lr0.0003_cw8_d8/  ...（共 12 个）
+      analysis/    pilot_validity_steps6000_boot10000_cascade_f1/
+    20261105-091500_seed5/                <- 以后再跑一遍：新的大文件夹，和上面互不相干
 ```
 
-- 文件夹名：`<YYYYMMDD-HHMMSS>_<类型>_<名称>_<设置>`。时间戳在最前面，所以按名字排序就是时间顺序。
-- 类型：`train`（训练 + 它自己的评测）、`baseline`、`analysis`、`precheck`、`freeze`。
+- 大文件夹名：`<YYYYMMDD-HHMMSS>[_标签]`，按名字排序就是时间顺序。`bash run_all.sh` 每次新建；`FW_RUN=<名字> bash run_all.sh` 续跑那一次（已有 `done.json` 的任务跳过）；单独运行某个脚本时，输出进 `FW_RUN` 指定的大文件夹，没设就进最新的那个。
+- 里面的子文件夹按类别分：`precheck`、`tune`、`compose`、`train`（训练 + 它自己的评测）、`baseline`、`analysis`；每个结果目录名 = `<名称>_<设置>`。
 - 设置：训练 = `ep<episode数>_<协议>_steps<步数>_bs<batch>_lr<学习率>_cw<变化格权重>_d<深度>`（unroll>1 时加 `_unr<K>`）；基线 = `bench-<bench 所在目录>`，部分评测会加 `_first<N>` 或划分名；分析 = `steps.._boot.._<cascade 指标>`。
-- 每个结果目录都有 `meta.json`（逻辑 id、类型、设置、创建时间）。分析脚本按 **逻辑 id + 设置** 在整个结果树里找“最新的、已完成的”结果（例如 `state_s0` 且 `steps == 6000`），不依赖文件夹名里的时间戳，所以实验 03 可以直接复用本实验的 `state_s0..s2`。分析输出的 `meta.json` 和 `pilot_validity.json` 里的 `inputs` 记录了这次用了哪些文件夹。
+- 每个结果目录都有 `meta.json`（逻辑 id、类型、所属大文件夹、设置、创建时间）。分析脚本**只读本次大文件夹**里按 **逻辑 id + 设置** 找到的“最新的、已完成的”结果（例如 `state_s0` 且 `steps == 6000`），所以重跑不会读到旧结果。实验 03 要复用本实验的 `state_s0..s2`，用 `find_latest(id, ..., run=<大文件夹名>)` 指定来源。分析输出的 `meta.json` 和 `pilot_validity.json` 里的 `inputs` 记录了这次用了哪些文件夹。
 - 一个训练目录里：`config.json`、`train_log.jsonl`、`ckpt.pt`、`done.json`、`eval.json`、`eval_samples.npz`、`train.log`、`eval.log`、`meta.json`（失败时有 `failed.json`）。基线目录里：`eval.json`、`eval_samples.npz`、`meta.json`。分析目录里：`pilot_validity.json`、`pilot_validity.md`、`meta.json`。前置检查目录里：`precheck.json`（以及检查 2、5 的临时训练子目录）。
-- 时间戳在 `make_jobs` 生成任务清单时确定，同一批 12 个任务共用一个时间戳。任务清单 `exp/jobs/<实验>_steps<步数>.json` 已存在时会直接复用，所以**中断后重跑同一条 `run_queue` 命令会续跑同一批目录**（已有 `done.json` 的跳过）。想另起一批新目录：`python -m exp.make_jobs pilot_validity --new`。
-- 短步数的冒烟测试（如 `--steps 20`）会生成自己的目录和任务清单文件，不会被分析当成正式结果（分析只取 `steps == --steps` 的结果，默认 6000）。
+- 任务清单 `<大文件夹>/jobs/<实验>_steps<步数>.json` 在 `make_jobs` 时生成，12 个任务的结果目录此时就确定；已存在则复用，所以**中断后重跑同一条 `run_queue` 命令会续跑同一批目录**。想重来一遍就开新的大文件夹（`export FW_RUN=$(python -m exp.new_run)`）。
+- 冒烟测试（如 `--steps 20`）请用 `--label smoke` 的单独大文件夹，不会和正式结果放一起。
 - 部分评测（`--limit`、`--splits`）写成 `eval_first3.json` 之类带后缀的文件，不会覆盖完整的 `eval.json`；基线的部分评测另建目录，且分析会忽略。
+- 旧版平铺结构（`01_pilot_validity/<时间戳>_<类型>_.../`）的目录仍然能被按 id 查到，但新的运行不再这样写。

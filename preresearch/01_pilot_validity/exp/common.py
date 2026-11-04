@@ -37,10 +37,9 @@ DEFAULT_BENCH = DEFAULT_DATA / "bench.npz"
 DEFAULT_VAL = Path(os.environ.get("FW_VAL", DEFAULT_DATA.parent / "data_val_v3")).expanduser().resolve()
 FROZEN = ROOT / "exp" / "configs" / "frozen.json"
 
-# All pre-experiment RESULTS live under RESULTS_ROOT/<experiment folder>/<timestamp>_<kind>_<id>_<settings>/ (plan 00 s.11.1).
+# All pre-experiment RESULTS live under RESULTS_ROOT/<experiment folder>/<run>/<category>/<item>/ (plan 00 s.11.1).
 RESULTS_ROOT = Path(os.environ.get("FW_RESULTS", PROJECT / "experiments" / "preresearch")).expanduser().resolve()
 EXP_NAME = "01_pilot_validity"          # this experiment's folder under RESULTS_ROOT
-COMMON_NAME = "00_common"               # pre-flight checks, tuning (shared by all experiments)
 
 
 def rel(p) -> str:
@@ -91,14 +90,70 @@ def slug(x) -> str:
     return re.sub(r"[^A-Za-z0-9.+=_-]+", "-", str(x)).strip("-")
 
 
-def result_name(kind: str, rid: str, settings: str = "", ts: str | None = None) -> str:
-    """`<YYYYMMDD-HHMMSS>_<kind>_<id>[_<settings>]` - the timestamp comes first so folders sort chronologically."""
-    return "_".join(p for p in (ts or now_ts(), slug(kind), slug(rid), slug(settings)) if p)
+#   RESULTS_ROOT/<exp>/<run>/<category>/<item>/        one RUN = one big folder holding everything of one execution
+#     run.json  jobs/  precheck/  tune/  train/  baseline/  analysis/
+# A new execution (run_all.sh) = a new <run> folder (`<YYYYMMDD-HHMMSS>[_label]`); old runs are never touched.
+_RUN_NOTE = {"shown": False}
 
 
-def new_result_dir(exp: str, kind: str, rid: str, settings: str = "", ts: str | None = None,
-                   create: bool = True) -> Path:
-    base = RESULTS_ROOT / exp / result_name(kind, rid, settings, ts)
+def category(kind: str, rid: str = "") -> str:
+    """Sub-folder of a run that holds this kind of result."""
+    rid = str(rid)
+    if kind == "freeze" or (kind == "train" and rid.startswith("tune_")):
+        return "tune"
+    if kind == "train" and rid.startswith("compose_"):
+        return "compose"
+    return kind
+
+
+def item_name(kind: str, rid: str, settings: str = "") -> str:
+    """`<id>[_<settings>]` - the run folder already carries the timestamp and the category folder the kind."""
+    return "_".join(p for p in (slug(rid), slug(settings)) if p)
+
+
+def list_runs(exp: str = EXP_NAME) -> list[Path]:
+    """Run folders of an experiment, oldest first (names start with the timestamp)."""
+    base = RESULTS_ROOT / exp
+    return sorted(d for d in base.iterdir() if (d / "run.json").is_file()) if base.is_dir() else []
+
+
+def start_run(exp: str = EXP_NAME, label: str = "", name: str | None = None) -> Path:
+    """Create the big folder of a new run (or, with an explicit `name`, make sure it exists)."""
+    name = name or "_".join(p for p in (now_ts(), slug(label)) if p)
+    d = RESULTS_ROOT / exp / name
+    if not (d / "run.json").exists():
+        d.mkdir(parents=True, exist_ok=True)
+        dump_json({"name": name, "exp": exp, "label": label, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "git": git_rev()}, d / "run.json")
+    return d
+
+
+def current_run(exp: str = EXP_NAME, create: bool = True) -> str | None:
+    """Name of the run that new results go to: `FW_RUN` if set (created when missing), else the newest existing run
+    of this experiment, else (only with create=True) a brand-new run. run_all.sh always starts a new run."""
+    if os.environ.get("FW_RUN"):
+        name = os.environ["FW_RUN"]
+        if create:
+            start_run(exp, name=name)
+        return name
+    runs = list_runs(exp)
+    if runs:
+        if not _RUN_NOTE["shown"]:
+            _RUN_NOTE["shown"] = True
+            print(f"[run] FW_RUN not set - using the newest run {rel(runs[-1])} "
+                  f"(start a fresh one with: export FW_RUN=$(python -m exp.new_run))", file=sys.stderr, flush=True)
+        return runs[-1].name
+    return start_run(exp).name if create else None
+
+
+def run_dir(exp: str = EXP_NAME, create: bool = True) -> Path | None:
+    name = current_run(exp, create)
+    return RESULTS_ROOT / exp / name if name else None
+
+
+def new_result_dir(exp: str, kind: str, rid: str, settings: str = "", create: bool = True,
+                   run: str | None = None) -> Path:
+    base = RESULTS_ROOT / exp / (run or current_run(exp)) / category(kind, rid) / item_name(kind, rid, settings)
     d, k = base, 1
     while d.exists():
         k += 1
@@ -110,31 +165,58 @@ def new_result_dir(exp: str, kind: str, rid: str, settings: str = "", ts: str | 
 
 def write_meta(d: Path, kind: str, rid: str, settings: dict, **extra) -> dict:
     """meta.json = the registry entry of a result folder (logical id, kind, settings). Lookups use it, not the name."""
-    meta = {"id": rid, "kind": kind, "exp": Path(d).parent.name, "name": Path(d).name,
+    d = Path(d)
+    parts = ()
+    for cand in (d, d.resolve()):
+        try:
+            parts = cand.relative_to(RESULTS_ROOT).parts
+            break
+        except ValueError:
+            continue
+    exp, run = (parts[0], parts[1]) if len(parts) == 4 else (parts[0] if parts else d.parent.name, None)
+    meta = {"id": rid, "kind": kind, "exp": exp, "run": run, "name": d.name,
             "created": time.strftime("%Y-%m-%d %H:%M:%S"), "settings": settings, **extra}
-    dump_json(meta, Path(d) / "meta.json")
+    dump_json(meta, d / "meta.json")
     return meta
 
 
-def iter_results(exp: str | None = None):
-    """Yield (dir, meta) for registered result folders, oldest first (names start with the timestamp)."""
+def iter_results(exp: str | None = None, run: str | None = None):
+    """Yield (dir, meta) for registered result folders, oldest first. Layout: `<exp>/<run>/<category>/<item>`;
+    folders of the older flat layout (`<exp>/<item>`) are still found (run = None)."""
     if not RESULTS_ROOT.exists():
         return
-    roots = [RESULTS_ROOT / exp] if exp else sorted(d for d in RESULTS_ROOT.iterdir() if d.is_dir())
+    exps = [RESULTS_ROOT / exp] if exp else sorted(d for d in RESULTS_ROOT.iterdir() if d.is_dir())
     found = []
-    for r in roots:
-        if r.is_dir():
-            for d in r.iterdir():
-                if (d / "meta.json").is_file():
-                    found.append((d, json.loads((d / "meta.json").read_text(encoding="utf-8"))))
-    yield from sorted(found, key=lambda t: t[0].name)
+
+    def add(d):
+        if (d / "meta.json").is_file():
+            found.append((d, json.loads((d / "meta.json").read_text(encoding="utf-8"))))
+
+    for e in exps:
+        if not e.is_dir():
+            continue
+        for r in e.iterdir():
+            if not r.is_dir():
+                continue
+            if (r / "run.json").is_file():
+                if run and r.name != run:
+                    continue
+                for c in r.iterdir():
+                    if c.is_dir():
+                        for d in c.iterdir():
+                            if d.is_dir():
+                                add(d)
+            elif not run:
+                add(r)
+    yield from sorted(found, key=lambda t: (t[1].get("run") or "", t[1].get("created", ""), t[0].name))
 
 
 def find_results(rid: str, kind: str | None = None, exp: str | None = None, require: str | None = None,
-                 match: dict | None = None) -> list[Path]:
-    """Result folders with this logical id (and kind / settings), keeping only those that contain `require`."""
+                 match: dict | None = None, run: str | None = None) -> list[Path]:
+    """Result folders with this logical id (and kind / settings), keeping only those that contain `require`.
+    `run` restricts the search to one run folder (default: all runs)."""
     out = []
-    for d, m in iter_results(exp):
+    for d, m in iter_results(exp, run):
         if m.get("id") != rid or (kind and m.get("kind") != kind):
             continue
         if require and not (d / require).exists():
@@ -146,19 +228,23 @@ def find_results(rid: str, kind: str | None = None, exp: str | None = None, requ
 
 
 def find_latest(rid: str, kind: str | None = None, exp: str | None = None, require: str | None = None,
-                match: dict | None = None) -> Path | None:
-    r = find_results(rid, kind, exp, require, match)
+                match: dict | None = None, run: str | None = None) -> Path | None:
+    r = find_results(rid, kind, exp, require, match, run)
     return r[-1] if r else None
 
 
 def resolve_run(arg, kind: str = "train", require: str | None = "ckpt.pt", steps: int | None = None) -> Path:
     """A run given as a folder path (absolute, relative to RESULTS_ROOT or to the cwd) or as its logical id
-    (e.g. `state_s0` -> the newest finished run with that id, trained for `steps` steps if given)."""
+    (e.g. `state_s0` -> the newest finished result with that id, trained for `steps` steps if given; the current
+    run folder is searched first, then all runs)."""
     p = Path(arg)
     for cand in ([p] if p.is_absolute() else [RESULTS_ROOT / p, Path.cwd() / p]):
         if cand.is_dir():
             return cand
-    d = find_latest(str(arg), kind, None, require, {"steps": steps} if steps else None)
+    match = {"steps": steps} if steps else None
+    cur = current_run(EXP_NAME, create=False)
+    d = (find_latest(str(arg), kind, EXP_NAME, require, match, cur) if cur else None) \
+        or find_latest(str(arg), kind, None, require, match)
     if d is None:
         raise SystemExit(f"no {kind} result found for {arg!r} (steps={steps}) under {rel(RESULTS_ROOT)}")
     print(f"[run] {arg} -> {rel(d)}", flush=True)

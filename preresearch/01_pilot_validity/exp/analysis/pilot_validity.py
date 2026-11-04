@@ -2,11 +2,12 @@
 
 python -m exp.analysis.pilot_validity [--steps 6000]
 
-Inputs are looked up by logical id in the results tree (newest finished result with the matching settings wins):
+Inputs are looked up by logical id inside the CURRENT run folder (FW_RUN, else the newest run; the newest finished
+result with the matching settings wins):
   runs      state_s0..s5, state_n64_s0..2, state_n16_s0..2   (kind=train, settings.steps == --steps, with eval_samples.npz)
   baselines copy_last, apply_edit, random_physics, oracle_reseed  (kind=baseline, same bench, all splits, no --limit)
   check E   compose_process, compose_shuffle
-Output: a NEW folder <results root>/01_pilot_validity/<timestamp>_analysis_pilot_validity_<settings>/ with
+Output: a NEW folder <results root>/01_pilot_validity/<run>/analysis/pilot_validity_<settings>/ with
 pilot_validity.json, pilot_validity.md and the list of input folders that were used.
 """
 from __future__ import annotations
@@ -45,13 +46,19 @@ def run_id(n: int, seed: int) -> str:
     return f"state_s{seed}" if n == 256 else f"state_n{n}_s{seed}"
 
 
+def this_run():
+    """The analysis reads only the results of the current run folder (a re-run never picks up old results)."""
+    return common.current_run(common.EXP_NAME, create=False)
+
+
 def find_run(n: int, seed: int):
-    return common.find_latest(run_id(n, seed), "train", None, "eval_samples.npz", {"steps": STEPS})
+    return common.find_latest(run_id(n, seed), "train", common.EXP_NAME, "eval_samples.npz", {"steps": STEPS}, this_run())
 
 
 def find_baseline(name: str):
-    return common.find_latest(name, "baseline", None, "eval_samples.npz",
-                              {"bench": common.bench_label(common.DEFAULT_BENCH), "splits": "all", "limit": None})
+    return common.find_latest(name, "baseline", common.EXP_NAME, "eval_samples.npz",
+                              {"bench": common.bench_label(common.DEFAULT_BENCH), "splits": "all", "limit": None},
+                              this_run())
 
 
 def load_runs(n: int, seeds) -> dict:
@@ -166,7 +173,7 @@ def analyze(split_ids: np.ndarray, boot: int = agg.N_BOOT) -> dict:
 def formation_share() -> dict:
     out = {"expected": EXPECTED_FORMATION_SHARE}
     for c in ("process", "shuffle"):
-        d = common.find_latest(f"compose_{c}", "train", None, "done.json")
+        d = common.find_latest(f"compose_{c}", "train", common.EXP_NAME, "done.json", None, this_run())
         log = d / "train_log.jsonl" if d else None
         if log is not None and log.exists():
             INPUTS[f"compose_{c}"] = d.name
@@ -298,12 +305,12 @@ def main(argv=None):
     ap.add_argument("--n-boot", type=int, default=agg.N_BOOT)
     ap.add_argument("--cascade-metric", choices=("cascade_f1", "cascade_f1_nonempty"), default="cascade_f1",
                     help="cascade_f1 scores 1.0 when both prediction and truth have no cascade (plan 00 section 6)")
-    ap.add_argument("--out", type=Path, default=None, help="result folder (default: new timestamped folder)")
+    ap.add_argument("--out", type=Path, default=None, help="result folder (default: <run>/analysis/...)")
     a = ap.parse_args(argv)
     CASCADE_KEY, STEPS = a.cascade_metric, a.steps
     ref = find_baseline("copy_last") or find_run(256, 0)
     if ref is None:
-        raise SystemExit(f"no evaluation outputs found under {common.rel(common.RESULTS_ROOT)} "
+        raise SystemExit(f"no evaluation outputs found in run {this_run()!r} under {common.rel(common.RESULTS_ROOT)} "
                          f"(run exp.evaluate for the baselines and the runs first)")
     split_ids = np.load(ref / "eval_samples.npz")["split_ids"]
     R = analyze(split_ids, a.n_boot)

@@ -1,7 +1,7 @@
 """One-off hyper-parameter selection (plan 00 section 13, item 7): state condition, validation set only.
 
-python -m exp.make_jobs tune && python -m exp.run_queue --jobs exp/jobs/tune_steps6000.json --gpus 0,1,2,3
-python -m exp.analysis.freeze            # writes exp/configs/frozen.json + a record folder in 00_common
+python -m exp.make_jobs tune && python -m exp.run_queue --jobs <run>/jobs/tune_steps6000.json --gpus 0,1,2,3
+python -m exp.analysis.freeze            # writes exp/configs/frozen.json + a record folder <run>/tune/ (current run only)
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def main(argv=None):
     ap.add_argument("--out", type=Path, default=common.FROZEN, help="frozen config to write")
     a = ap.parse_args(argv)
     newest = {}                                           # one entry per (lr, cw, depth): the newest finished run
-    for d, m in common.iter_results(common.COMMON_NAME):
+    for d, m in common.iter_results(common.EXP_NAME, common.current_run(common.EXP_NAME, create=False)):
         if m["kind"] == "train" and m["id"].startswith("tune_") and (d / "done.json").exists() \
                 and m["settings"].get("steps") == a.steps:
             v = last_val(d)
@@ -43,7 +43,7 @@ def main(argv=None):
            "selected_by": "validation cascade-cell accuracy of the state model (bench not used)",
            "selected_run": best["run"], "n_candidates": len(rows), "table": rows}
     common.dump_json(out, a.out)
-    rec = common.new_result_dir(common.COMMON_NAME, "freeze", "tune", f"steps{a.steps}_best-lr{best['lr']:g}"
+    rec = common.new_result_dir(common.EXP_NAME, "freeze", "tune", f"steps{a.steps}_best-lr{best['lr']:g}"
                                 f"-cw{best['change_weight']:g}-d{best['depth']}")
     common.write_meta(rec, "freeze", "tune", {"steps": a.steps, "best": best})
     common.dump_json(out, rec / "frozen.json")
