@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#263e35">
+  <title>Block &amp; Bloom — A building sandbox</title>
+  <link rel="stylesheet" href="style.css?v=build6">
+  <link rel="icon" href="data:,">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><div class="brand-mark" aria-hidden="true"><i></i><b></b></div><div><h1>BLOCK <span>&amp;</span> BLOOM</h1><p>A LITTLE WORLD. A LOT TO BUILD.</p></div></div>
+      <div class="header-right"><span class="badge"><i></i> CREATIVE SANDBOX</span><button id="help" class="quiet">How to play <kbd>?</kbd></button></div>
+    </header>
+    <main class="layout">
+      <aside class="panel inventory">
+        <div class="panel-heading"><span class="eyebrow">THE BUILDER'S KIT</span><span class="count">15 items</span></div>
+        <h2>Make it yours.</h2>
+        <p class="muted intro">Unlimited blocks. Zero pressure.</p>
+        <div class="tabs" role="tablist" aria-label="Materials">
+          <button class="active" data-group="Build" role="tab" aria-selected="true">Build</button><button data-group="Nature" role="tab" aria-selected="false">Nature</button><button data-group="Decor" role="tab" aria-selected="false">Decor</button>
+        </div>
+        <div id="materials" class="material-grid"></div>
+        <div class="selection"><canvas id="selected-icon" width="40" height="40"></canvas><div><b id="selected-name">Oak planks</b><span id="selected-layer">FOREGROUND BLOCK</span></div></div>
+        <p id="selected-hint" class="material-hint">Floors &amp; beams · span 4</p>
+        <div class="tip"><b>Build in layers.</b><p>Solid blocks shape your house. Timber walls and windows go behind it, so you can walk inside. They must attach to something solid.</p></div>
+        <div class="storage"><span class="eyebrow">YOUR WORLD</span><div class="button-row"><button id="save">Save</button><button id="load">Load</button></div><button id="new-world" class="quiet full">New meadow</button><small id="save-status">Autosave every 10 seconds</small></div>
+      </aside>
+      <section class="game-area" aria-label="Game">
+        <div class="world-toolbar"><div class="tool-group" aria-label="Build tools"><button data-tool="build" class="active" title="Build (B)">Build <kbd>B</kbd></button><button data-tool="erase" title="Erase (X)">Erase <kbd>X</kbd></button><button data-tool="pick" title="Pick material (Q)">Pick <kbd>Q</kbd></button></div><div class="view-tools"><button id="grid-toggle" title="Grid (G)">Grid</button><button id="gravity-toggle" class="active">Gravity ON</button><button id="day-toggle">Daylight</button></div></div>
+        <div class="viewport">
+          <canvas id="world" width="1152" height="672" tabindex="0" aria-label="Interactive pixel building world. WASD to move, Space to jump, mouse to build."></canvas>
+          <div class="world-title"><span class="live-dot"></span><b>Willow Meadow</b><span id="world-day">DAY 01</span></div>
+          <div class="world-coordinates" id="coordinates">X 28 / Y 28</div>
+          <div class="zoom-controls"><button id="zoom-out" aria-label="Zoom out">−</button><span id="zoom-label">100%</span><button id="zoom-in" aria-label="Zoom in">+</button><button id="center-camera" title="Center on player (Home)">Center</button></div>
+          <div class="toast" id="toast" role="status">Your meadow is ready. Let's build something.</div>
+        </div>
+        <div class="hotbar-wrap"><span class="hotbar-label">QUICK SELECT</span><div id="hotbar" class="hotbar"></div><div class="history-buttons"><button id="undo" title="Undo (Z)">Undo</button><button id="redo" title="Redo (Y)">Redo</button></div></div>
+        <div class="play-controls"><span><kbd>A</kbd><kbd>D</kbd> Move</span><span><kbd>Space</kbd> Jump</span><span><kbd>E</kbd> Open door</span><span><kbd>F</kbd> Fly</span><span><kbd>Drag</kbd> Build / erase</span><span><kbd>Shift</kbd> Erase wall</span></div>
+        <div class="below-world"><p><span class="status-dot"></span><span id="status">Creative mode · unlimited materials</span></p><div><button id="record-toggle" class="quiet">Record OFF</button><button id="export" class="quiet">Export JSON</button><button id="screenshot" class="quiet">Screenshot</button></div></div>
+      </section>
+      <aside class="panel projects">
+        <span class="eyebrow">A PLACE TO START</span><h2>Build a home.</h2><p class="muted intro">A blueprint, not a rulebook.</p>
+        <canvas id="project-preview" width="200" height="122" aria-label="Cottage preview"></canvas>
+        <div class="project-row"><select id="project-select" aria-label="Building blueprint"><option>Cottage</option><option>Workshop</option></select><button id="blueprint-toggle" class="small active">Guide ON</button></div>
+        <div class="progress-heading"><span>BUILD PROGRESS</span><b id="completion">0%</b></div><div class="progress-track"><div id="progress-bar"></div></div>
+        <div id="checklist" class="checklist"></div>
+        <button id="demo" class="primary full">Watch it being built <kbd>P</kbd></button><p class="demo-note">Animated, block by block. Undo restores your build.</p>
+        <div class="map-heading"><span class="eyebrow">EXPLORE THE MEADOW</span><span>96 × 40</span></div><canvas id="minimap" width="200" height="84" aria-label="Map. Click to move the camera."></canvas><p class="demo-note">Click the map to explore. Scroll to zoom.</p>
+        <details class="rules"><summary>How the world works</summary><p>Stone, timber, brick and roofing carry load. Unsupported blocks fall. Leaves, water and sand cannot support a building.</p><p>Doors occupy two cells. Place their bottom on a solid floor. Walls, windows, ladders and torches live on the background layer and must touch a solid block (or a connected wall); they cannot float, and vanish if their support is removed. Flowers need grass or dirt below.</p><p>Gravity OFF lets you design freely. Turn it back on to test your structure.</p></details>
+      </aside>
+    </main>
+    <footer><span>FORMWORLD / BUILDING LAB</span><span>Procedural pixel art · all assets made for this world</span><span>MAKE A HOUSE. THEN MAKE A VILLAGE.</span></footer>
+  </div>
+  <dialog id="help-dialog"><div class="dialog-heading"><h2>Welcome, builder.</h2><button id="close-help" aria-label="Close help">Close</button></div><p>Build anywhere you can see. Walk through your house and make it feel like home.</p><dl><dt>Build / remove</dt><dd>Hold left / right mouse button and drag. Right-click erases solid blocks first. Hold Shift to erase the background wall.</dd><dt>Move / climb</dt><dd>A / D to walk, Space to jump, W / S on ladders. F toggles creative flight; use WASD to fly.</dd><dt>Doors</dt><dd>Select Oak door and click its bottom cell above a solid floor. Leave two cells free. E opens / closes a door near you.</dd><dt>Tools</dt><dd>B build, X erase, Q eyedropper, 1–9 quick select, G grid, Z undo, Y redo, P animated build.</dd><dt>Camera</dt><dd>Scroll to zoom. Middle-drag or arrow keys to pan. Home centers on you. The minimap jumps to another part of the meadow.</dd><dt>Recording</dt><dd>Record captures before/after states, background layers and actual actions / physics ticks. Export JSON downloads the session. Saved worlds stay in this browser.</dd></dl><button id="start-playing" class="primary full">Back to the meadow</button></dialog>
+  <dialog id="confirm-dialog"><h2 id="confirm-title">Start fresh?</h2><p id="confirm-text"></p><div class="button-row"><button id="confirm-cancel">Cancel</button><button id="confirm-yes" class="primary">Continue</button></div></dialog>
+  <script src="physics.js?v=build6"></script><script src="world.js?v=build6"></script><script src="painter.js?v=build6"></script><script src="app.js?v=build6"></script>
+</body>
+</html>

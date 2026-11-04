@@ -1,0 +1,184 @@
+[
+  {
+    "type": "place",
+    "x": 7,
+    "y": 20,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 7,
+    "y": 19,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 7,
+    "y": 18,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 7,
+    "y": 17,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 12,
+    "y": 20,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 12,
+    "y": 19,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 12,
+    "y": 18,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 12,
+    "y": 17,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 7,
+    "y": 16,
+    "material": 3,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 8,
+    "y": 16,
+    "material": 3,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 9,
+    "y": 16,
+    "material": 3,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 10,
+    "y": 16,
+    "material": 3,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 11,
+    "y": 16,
+    "material": 3,
+    "layer": "front"
+  },
+  {
+    "type": "place",
+    "x": 12,
+    "y": 16,
+    "material": 3,
+    "layer": "front"
+  },
+  {
+    "type": "remove",
+    "x": 7,
+    "y": 20,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "remove",
+    "x": 7,
+    "y": 19,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "remove",
+    "x": 7,
+    "y": 18,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "remove",
+    "x": 7,
+    "y": 17,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "noop",
+    "x": 0,
+    "y": 0,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "noop",
+    "x": 0,
+    "y": 0,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "noop",
+    "x": 0,
+    "y": 0,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "noop",
+    "x": 0,
+    "y": 0,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "noop",
+    "x": 0,
+    "y": 0,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "noop",
+    "x": 0,
+    "y": 0,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "noop",
+    "x": 0,
+    "y": 0,
+    "material": 2,
+    "layer": "front"
+  },
+  {
+    "type": "noop",
+    "x": 0,
+    "y": 0,
+    "material": 2,
+    "layer": "front"
+  }
+]

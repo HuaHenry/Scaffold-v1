@@ -1,0 +1,7 @@
+{
+  "lr": 0.0003,
+  "change_weight": 8,
+  "depth": 8,
+  "unroll": 1,
+  "selected_by": "plan 00 section 9 defaults (NOT tuned yet; run make_jobs tune + exp.analysis.freeze to overwrite)"
+}

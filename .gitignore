@@ -1,0 +1,20 @@
+# environments and caches
+.venv/
+**/.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.DS_Store
+game_code/.playwright-cli/
+
+# experiment results (checkpoints are large and reproducible)
+experiments/
+
+# generated data: regenerate with `python run.py --data-v3`
+# (comment these out if you want to ship the data in the repo)
+game_code/output/data/
+game_code/output/data_v3/
+game_code/output/data_val_v3/
+
+# job lists are generated
+preresearch/*/exp/jobs/

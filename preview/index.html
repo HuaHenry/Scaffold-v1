@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>FormWorld-2D 数据预览</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#f4f5f7; --card:#fff; --line:#d9dce1; --txt:#222; --sub:#667; --acc:#2f6fdb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--txt); background:var(--bg); display:flex; height:100vh; }
+  aside { width:300px; flex:none; background:var(--card); border-right:1px solid var(--line); padding:14px; overflow:auto; }
+  main { flex:1; min-width:0; overflow:auto; padding:14px; }
+  h1 { font-size:16px; margin:0 0 10px; }
+  h2 { font-size:13px; margin:16px 0 6px; color:var(--sub); font-weight:600; border-top:1px solid var(--line); padding-top:10px; }
+  label { display:flex; align-items:center; gap:6px; margin:3px 0; cursor:pointer; }
+  select { min-width:0; max-width:100%; }
+  select, input[type=number], button { font:inherit; padding:3px 8px; border:1px solid var(--line); border-radius:5px; background:#fff; }
+  button { cursor:pointer; } button:hover { border-color:var(--acc); color:var(--acc); }
+  button.primary { background:var(--acc); color:#fff; border-color:var(--acc); } button.primary:hover { color:#fff; opacity:.9; }
+  input[type=range] { width:100%; }
+  .row { display:flex; gap:6px; align-items:center; margin:5px 0; flex-wrap:wrap; }
+  .grow { flex:1; }
+  .hint { color:var(--sub); font-size:12px; }
+  #panels { display:flex; flex-wrap:wrap; gap:14px; align-items:flex-start; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px; }
+  .panel h3 { margin:0 0 4px; font-size:14px; display:flex; justify-content:space-between; gap:8px; }
+  .panel h3 small { color:var(--sub); font-weight:400; }
+  canvas.view { display:block; image-rendering:pixelated; border:1px solid var(--line); }
+  canvas.tl { display:block; margin-top:4px; cursor:pointer; }
+  .pinfo { margin-top:4px; font-size:12px; color:var(--sub); min-height:56px; }
+  .tag { display:inline-block; padding:0 6px; border-radius:9px; color:#fff; font-size:11px; margin-right:4px; }
+  .t-form { background:#3c78dc; } .t-op { background:#e68c28; } .t-ok { background:#4caf50; } .t-reset { background:#999; }
+  .t-ctx { background:#888; } .t-act { background:#d33; } .t-tick { background:#1a9aa0; }
+  #bar { position:sticky; top:-14px; z-index:5; background:var(--bg); padding:0 0 10px; }
+  #bar .row { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin:0; }
+  #frameLabel { min-width:96px; font-variant-numeric:tabular-nums; }
+  #status { color:var(--sub); font-size:12px; margin-top:8px; min-height:18px; font-variant-numeric:tabular-nums; }
+  #scene { margin-top:12px; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 12px; font-size:13px; }
+  #scene pre { margin:4px 0 0; white-space:pre-wrap; word-break:break-all; font-size:12px; color:var(--sub); }
+  .legend { display:grid; grid-template-columns:1fr 1fr; gap:2px 8px; font-size:12px; }
+  .chip { display:inline-block; width:12px; height:12px; border:1px solid #0003; vertical-align:-2px; margin-right:4px; }
+  #msg { color:#c22; font-size:13px; }
+  kbd { background:#eee; border:1px solid #ccc; border-radius:3px; padding:0 4px; font-size:11px; }
+</style>
+</head>
+<body>
+<aside>
+  <h1>FormWorld-2D 数据预览</h1>
+
+  <h2 style="border:0;margin-top:0">数据</h2>
+  <label><input type="radio" name="kind" value="train" checked> 训练集（视频）</label>
+  <label><input type="radio" name="kind" value="bench"> FormBench（评测样本）</label>
+
+  <div id="trainCtl">
+    <h2>训练条件（可多选，同步对比）</h2>
+    <div id="conds"></div>
+    <div class="row">Episode
+      <button id="epPrev">‹</button>
+      <input type="number" id="ep" value="0" min="0" style="width:72px">
+      <button id="epNext">›</button>
+      <button id="epRand" title="随机">随机</button>
+    </div>
+    <div class="hint" id="epHint"></div>
+    <div class="hint">各条件的同一 episode 序号对应同一个场景。</div>
+  </div>
+
+  <div id="benchCtl" style="display:none">
+    <h2>FormBench 样本</h2>
+    <div class="row">划分 <select id="split" class="grow"></select></div>
+    <div class="row">样本
+      <button id="bPrev">‹</button>
+      <input type="number" id="bi" value="0" min="0" style="width:72px">
+      <button id="bNext">›</button>
+      <button id="bRand">随机</button>
+    </div>
+    <div class="hint" id="bHint"></div>
+    <div class="hint">左右两栏是同一初始结构上的两个候选干预；第 0 帧是初始状态，第 1 帧起为各 tick。</div>
+  </div>
+
+  <h2>显示</h2>
+  <div class="row">渲染
+    <select id="mode" class="grow">
+      <option value="tex">游戏真实贴图（painter.js）</option>
+      <option value="flat">平涂调色板（render.py，模型/解析器用的精确编码）</option>
+    </select>
+  </div>
+  <div class="row">图层
+    <select id="layer" class="grow">
+      <option value="comp">合成（前景优先，其次背景）</option>
+      <option value="fg">仅前景层</option>
+      <option value="bg">仅背景层</option>
+    </select>
+  </div>
+  <div class="row">缩放 <input type="range" id="scale" min="4" max="18" value="10" class="grow"></div>
+  <label><input type="checkbox" id="showAct" checked> 框出本帧动作（<span style="color:#2a2">放置</span> / <span style="color:#d22">拆除</span> / <span style="color:#d90">交互</span>）</label>
+  <label><input type="checkbox" id="showDiff" checked> 框出相对上一帧变化的格子（<span style="color:#d0d">品红</span>）</label>
+
+  <h2>材料图例</h2>
+  <div class="legend" id="legend"></div>
+
+  <h2>快捷键</h2>
+  <div class="hint"><kbd>空格</kbd> 播放/暂停　<kbd>←</kbd><kbd>→</kbd> 逐帧　<kbd>↑</kbd><kbd>↓</kbd> 切换 episode / 样本</div>
+</aside>
+
+<main>
+  <div id="bar">
+    <div class="row">
+      <button id="play" class="primary" style="width:64px">播放</button>
+      <button id="prev">‹ 上一帧</button>
+      <button id="next">下一帧 ›</button>
+      <span id="frameLabel"></span>
+      <input type="range" id="frame" min="0" max="63" value="0" class="grow" style="min-width:160px">
+      <select id="speed">
+        <option value="2">2 帧/秒</option>
+        <option value="4" selected>4 帧/秒</option>
+        <option value="8">8 帧/秒</option>
+        <option value="16">16 帧/秒</option>
+      </select>
+      <label><input type="checkbox" id="loop" checked> 循环</label>
+    </div>
+  </div>
+  <div id="msg"></div>
+  <div id="panels"></div>
+  <div id="status">鼠标移到画面上可查看格子的坐标与材料。</div>
+  <div id="scene"></div>
+</main>
+
+<script src="/game/physics.js"></script>
+<script src="/game/painter.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const CS = 16;                       // canvas 内部每格像素（与游戏贴图 16×16 一致）
+let INFO = null, PAL = [], panels = [], t = 0, timer = null, kind = 'train';
+
+const hex2rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+function dec(b64) { const s = atob(b64), a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return a; }
+const matName = m => `${INFO.materials[m] ?? '?'}(${m})`;
+const esc = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+function msg(s) { $('#msg').textContent = s || ''; }
+
+async function api(url) {
+  const r = await fetch(url); const j = await r.json();
+  if (!r.ok || j.error) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+/* ---------- 初始化 ---------- */
+async function init() {
+  INFO = await api('/api/info');
+  PAL = INFO.palette.map(hex2rgb);
+  $('#legend').innerHTML = INFO.palette.map((c, i) => `<div><span class="chip" style="background:${c}"></span>${i} ${INFO.materials[i]}</div>`).join('');
+
+  const conds = Object.keys(INFO.train);
+  $('#conds').innerHTML = conds.map((c, i) => {
+    const v = INFO.train[c];
+    return `<label><input type="checkbox" name="cond" value="${c}" ${c === 'process' ? 'checked' : ''}> <b>${c}</b>
+      <span class="hint">${v.episodes}×${v.frames}帧 · 形成 ${v.formation_frames}</span></label>`;
+  }).join('');
+  if (!conds.length) { kind = 'bench'; document.querySelector('input[value=bench]').checked = true; }
+  if (!INFO.bench) document.querySelector('input[value=bench]').disabled = true;
+  if (INFO.bench) {
+    $('#split').innerHTML = INFO.bench.splits.map(s => `<option>${s}</option>`).join('');
+  }
+  bind();
+  setKind(kind);
+}
+
+function bind() {
+  document.querySelectorAll('input[name=kind]').forEach(e => e.onchange = () => setKind(e.value));
+  $('#conds').onchange = () => reload(true);
+  $('#ep').onchange = () => reload(false);
+  $('#epPrev').onclick = () => stepEp(-1); $('#epNext').onclick = () => stepEp(1);
+  $('#epRand').onclick = () => { $('#ep').value = Math.floor(Math.random() * maxEp()); reload(false); };
+  $('#split').onchange = () => { $('#bi').value = 0; reload(false); };
+  $('#bi').onchange = () => reload(false);
+  $('#bPrev').onclick = () => stepEp(-1); $('#bNext').onclick = () => stepEp(1);
+  $('#bRand').onclick = () => { $('#bi').value = Math.floor(Math.random() * maxEp()); reload(false); };
+  ['#mode', '#layer', '#showAct', '#showDiff'].forEach(s => $(s).onchange = drawAll);
+  $('#scale').oninput = applyScale;
+  $('#play').onclick = togglePlay;
+  $('#prev').onclick = () => { pause(); seek(t - 1); };
+  $('#next').onclick = () => { pause(); seek(t + 1); };
+  $('#frame').oninput = e => { pause(); seek(+e.target.value); };
+  $('#speed').onchange = () => { if (timer) { pause(); play(); } };
+  addEventListener('keydown', e => {
+    if (['INPUT', 'SELECT'].includes(document.activeElement.tagName) && document.activeElement.type !== 'range' && document.activeElement.type !== 'checkbox') return;
+    if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+    else if (e.code === 'ArrowLeft') { e.preventDefault(); pause(); seek(t - 1); }
+    else if (e.code === 'ArrowRight') { e.preventDefault(); pause(); seek(t + 1); }
+    else if (e.code === 'ArrowUp') { e.preventDefault(); stepEp(-1); }
+    else if (e.code === 'ArrowDown') { e.preventDefault(); stepEp(1); }
+  });
+}
+
+function setKind(k) {
+  kind = k;
+  $('#trainCtl').style.display = k === 'train' ? '' : 'none';
+  $('#benchCtl').style.display = k === 'bench' ? '' : 'none';
+  t = 0; reload(true);
+}
+
+function maxEp() {
+  if (kind === 'train') {
+    const cs = selConds(); return cs.length ? Math.min(...cs.map(c => INFO.train[c].episodes)) : 1;
+  }
+  return INFO.bench.indices[$('#split').value].length;
+}
+function stepEp(d) {
+  const el = kind === 'train' ? $('#ep') : $('#bi');
+  el.value = Math.max(0, Math.min(maxEp() - 1, (+el.value || 0) + d)); reload(false);
+}
+const selConds = () => [...document.querySelectorAll('input[name=cond]:checked')].map(e => e.value);
+
+/* ---------- 加载 ---------- */
+async function reload(rebuild) {
+  pause(); msg('');
+  try {
+    if (kind === 'train') {
+      const cs = selConds();
+      if (!cs.length) { panels = []; buildPanels(); return; }
+      const ep = Math.max(0, Math.min(maxEp() - 1, +$('#ep').value || 0)); $('#ep').value = ep;
+      $('#epHint').textContent = `范围 0–${maxEp() - 1}`;
+      const rs = await Promise.all(cs.map(c => api(`/api/train?cond=${c}&ep=${ep}`)));
+      panels = rs.map(trainPanel);
+    } else {
+      const idx = INFO.bench.indices[$('#split').value];
+      const n = Math.max(0, Math.min(idx.length - 1, +$('#bi').value || 0)); $('#bi').value = n;
+      $('#bHint').textContent = `该划分共 ${idx.length} 个样本（全局编号 ${idx[n]}）`;
+      const r = await api(`/api/bench?i=${idx[n]}`);
+      panels = benchPanels(r);
+    }
+    buildPanels();
+  } catch (e) { msg('加载失败：' + e.message); }
+}
+
+function trainPanel(r) {
+  const T = r.T, seg = [];
+  for (let i = 0; i < T; i++) seg.push([r.phase[i] === 0 ? '#3c78dc' : '#e68c28', r.cont[i] ? '#4caf50' : '#999']);
+  const nForm = r.phase.filter(p => p === 0).length;
+  return {
+    title: r.cond, sub: `episode ${r.episode}`, T, H: r.H, W: r.W, fg: dec(r.fg), bg: dec(r.bg),
+    actions: r.actions, cont: r.cont, seg, scene: r.scene, raw: r,
+    info: t => {
+      const ph = r.phase[t] === 0 ? '<span class="tag t-form">形成片段</span>' : '<span class="tag t-op">操作片段</span>';
+      const ct = r.cont[t] ? '<span class="tag t-ok">连续</span>' : '<span class="tag t-reset">重置/跳变</span>';
+      return `${ph}${ct}<br>${actText(r.actions[t])}`;
+    },
+    foot: `形成帧 ${nForm} / 操作帧 ${T - nForm}`,
+  };
+}
+
+function benchPanels(r) {
+  const ps = r.panels.map(p => {
+    // v3：干预是 {kind, steps:[{t, actions}]} 的复合干预，按 t 展开到对应帧；v2 的单个动作原样保留
+    let ivKind = '', nAct = 0;
+    const acts = p.actions.map(() => []);
+    p.actions.forEach((l, i) => (l || []).forEach(a => {
+      if (a && a.steps) {
+        ivKind = a.kind;
+        a.steps.forEach(st => { const f = Math.min(acts.length - 1, i + st.t); acts[f].push(...st.actions); nAct += st.actions.length; });
+      } else { acts[i].push(a); nAct++; }
+    }));
+    const seg = []; for (let i = 0; i < p.T; i++) seg.push([i === 0 ? '#888' : i === 1 ? '#d33' : '#1a9aa0', '#4caf50']);
+    return {
+      title: `干预 ${p.k}${p.k === 0 ? '（真值效果更大）' : ''}`,
+      sub: `${ivKind ? ivKind + ' · ' + nAct + ' 个动作 · ' : ''}变化率 ${p.label.toFixed(3)} · 终态变化 ${p.n_changed} 格 · 第 ${p.settled_at} tick 稳定`,
+      T: p.T, H: r.H, W: r.W, fg: dec(p.fg), bg: dec(p.bg), actions: acts, cont: null, seg,
+      info: t => {
+        const tag = t === 0 ? '<span class="tag t-ctx">初始状态</span>' : t === 1 ? '<span class="tag t-act">施加干预并 tick 1</span>' : `<span class="tag t-tick">tick ${t}</span>`;
+        return `${tag}<br>${actText(p.actions[t])}`;
+      },
+      foot: '',
+    };
+  });
+  ps.scene = { kind: r.scene_kind, split: r.split, specs: r.scene, rank_valid: r.rank_valid, index: r.index };
+  return ps;
+}
+
+function actText(list) {
+  if (!list || !list.length) return '本帧无动作';
+  const f = a => `${a.type}${a.type === 'place' ? ' ' + matName(a.material) : ''} @(${a.x},${a.y}) ${a.layer === 'back' ? '背景层' : '前景层'}`;
+  const s = list.slice(0, 6).map(f).join('<br>');
+  return `${list.length} 个动作<br>${s}${list.length > 6 ? `<br>… 另 ${list.length - 6} 个` : ''}`;
+}
+
+/* ---------- 构建与绘制 ---------- */
+function buildPanels() {
+  const box = $('#panels'); box.innerHTML = '';
+  const T = panels.length ? Math.min(...panels.map(p => p.T)) : 1;
+  $('#frame').max = T - 1; t = Math.min(t, T - 1);
+  panels.forEach(p => {
+    const d = document.createElement('div'); d.className = 'panel';
+    d.innerHTML = `<h3><span>${esc(p.title)}</span><small>${esc(p.sub || '')}</small></h3><canvas class="view"></canvas><canvas class="tl"></canvas><div class="pinfo"></div>`;
+    box.appendChild(d);
+    p.cv = d.querySelector('.view'); p.tl = d.querySelector('.tl'); p.pi = d.querySelector('.pinfo');
+    p.cv.width = p.W * CS; p.cv.height = p.H * CS;
+    p.off = document.createElement('canvas'); p.off.width = p.W; p.off.height = p.H;
+    p.octx = p.off.getContext('2d'); p.img = p.octx.createImageData(p.W, p.H);
+    p.cv.onmousemove = e => hover(p, e); p.cv.onmouseleave = () => $('#status').textContent = '鼠标移到画面上可查看格子的坐标与材料。';
+    p.tl.onclick = e => { const r = p.tl.getBoundingClientRect(); pause(); seek(Math.floor((e.clientX - r.left) / r.width * p.T)); };
+  });
+  applyScale(); renderScene(); drawAll();
+}
+
+function applyScale() {
+  const s = +$('#scale').value;
+  panels.forEach(p => {
+    p.cv.style.width = p.W * s + 'px'; p.cv.style.height = p.H * s + 'px';
+    p.tl.style.width = p.W * s + 'px'; p.tl.style.height = '14px';
+    p.tl.width = p.W * s * 2; p.tl.height = 28;
+  });
+  drawAll();
+}
+
+function drawAll() { panels.forEach(drawPanel); updateBar(); }
+
+function drawPanel(p) {
+  const { W, H } = p, base = t * W * H, layer = $('#layer').value, d = p.img.data;
+  const ctx = p.cv.getContext('2d'); ctx.imageSmoothingEnabled = false;
+  if ($('#mode').value === 'tex' && typeof FWArt !== 'undefined') {
+    // 与游戏 painter.js 的 tile() 相同：先画背景层，再画前景层；贴图变体取决于格子坐标
+    const sky = ctx.createLinearGradient(0, 0, 0, H * CS);
+    sky.addColorStop(0, '#71b7c5'); sky.addColorStop(.65, '#b5dcd5'); sky.addColorStop(1, '#e4e8be');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W * CS, H * CS);
+    const tile = (v, x, y) => ctx.drawImage(FWArt.texture(v, (x * 17 + y * 3) % 5), x * CS, y * CS, CS, CS);
+    for (let i = 0; i < W * H; i++) {
+      const b = p.bg[base + i]; if (b && layer !== 'fg') tile(b, i % W, (i / W) | 0);
+    }
+    for (let i = 0; i < W * H; i++) {
+      const f = p.fg[base + i]; if (f && layer !== 'bg') tile(f, i % W, (i / W) | 0);
+    }
+  } else {
+    for (let i = 0; i < W * H; i++) {
+      const f = p.fg[base + i], b = p.bg[base + i];
+      const m = layer === 'fg' ? f : layer === 'bg' ? b : (f ? f : b), c = PAL[m] || [255, 0, 255];
+      d[4 * i] = c[0]; d[4 * i + 1] = c[1]; d[4 * i + 2] = c[2]; d[4 * i + 3] = 255;
+    }
+    p.octx.putImageData(p.img, 0, 0);
+    ctx.drawImage(p.off, 0, 0, W * CS, H * CS);
+  }
+
+  if ($('#showDiff').checked && t > 0 && (p.cont === null || p.cont[t])) {
+    const pb = (t - 1) * W * H; ctx.strokeStyle = 'rgba(220,0,220,.95)'; ctx.lineWidth = 1.5;
+    for (let i = 0; i < W * H; i++) {
+      if (p.fg[base + i] !== p.fg[pb + i] || p.bg[base + i] !== p.bg[pb + i]) {
+        const x = i % W, y = (i / W) | 0; ctx.strokeRect(x * CS + 1, y * CS + 1, CS - 2, CS - 2);
+      }
+    }
+  }
+  if ($('#showAct').checked) {
+    ctx.lineWidth = 2.5;
+    for (const a of (p.actions[t] || [])) {
+      ctx.strokeStyle = a.type === 'place' ? '#22aa22' : a.type === 'remove' ? '#dd2222' : '#dd9900';
+      ctx.strokeRect(a.x * CS + 1.5, a.y * CS + 1.5, CS - 3, CS - 3);
+    }
+  }
+  // 时间轴
+  const tc = p.tl.getContext('2d'), w = p.tl.width, h = p.tl.height, sw = w / p.T;
+  tc.clearRect(0, 0, w, h);
+  p.seg.forEach((s, i) => { tc.fillStyle = s[0]; tc.fillRect(i * sw, 0, sw - 0.5, h / 2 - 1); tc.fillStyle = s[1]; tc.fillRect(i * sw, h / 2, sw - 0.5, h / 2); });
+  tc.strokeStyle = '#000'; tc.lineWidth = 3; tc.strokeRect(t * sw, 1, sw, h - 2);
+  p.pi.innerHTML = p.info(t) + (p.foot ? `<br><span style="color:#999">${p.foot}</span>` : '');
+}
+
+function hover(p, e) {
+  const r = p.cv.getBoundingClientRect();
+  const x = Math.floor((e.clientX - r.left) / r.width * p.W), y = Math.floor((e.clientY - r.top) / r.height * p.H);
+  if (x < 0 || y < 0 || x >= p.W || y >= p.H) return;
+  const i = t * p.W * p.H + y * p.W + x;
+  $('#status').textContent = `${p.title}  (x=${x}, y=${y})  前景 ${matName(p.fg[i])}  背景 ${matName(p.bg[i])}`;
+}
+
+function updateBar() {
+  const T = panels.length ? Math.min(...panels.map(p => p.T)) : 0;
+  $('#frame').value = t; $('#frameLabel').textContent = `帧 ${t} / ${Math.max(0, T - 1)}`;
+  $('#play').textContent = timer ? '暂停' : '播放';
+}
+
+function renderScene() {
+  const box = $('#scene');
+  if (!panels.length) { box.innerHTML = '请在左侧至少选择一个训练条件。'; return; }
+  if (kind === 'train') {
+    const s = panels[0].scene;
+    const chunk = s ? (s.max_chunk != null ? `每批最多 ${s.max_chunk} 个动作` : `每批 ${s.chunk_size} 个动作`) : '';
+    const v3 = s && s.builder ? ` · ${s.n_struct} 个结构 · ${s.mode} · 失误 ${s.builder.mistake} / 散落 ${s.builder.stray} / 漏放 ${s.builder.drop}` : '';
+    box.innerHTML = s ? `<b>场景</b>：${esc(s.kind)}　<span class="hint">动作数 ${s.n_actions} · ${chunk}${v3} · 形成完成 ${s.formation_settled}</span>
+      <pre>${esc(JSON.stringify(s.specs))}</pre>` : '无场景信息';
+    const sh = panels.find(p => p.title === 'shuffle');
+    if (sh) box.innerHTML += `<div class="hint" style="margin-top:6px">shuffle 的 0–31 帧是把 process 的形成帧顺序打乱，因此这些帧的“连续”标记为重置/跳变。</div>`;
+  } else {
+    const s = panels.scene;
+    box.innerHTML = `<b>划分</b>：${s.split}　<b>场景</b>：${esc(s.kind || panels.scene_kind || (s.kinds || []).join('+'))}　<span class="hint">样本全局编号 ${s.index} · 排序可用 ${s.rank_valid}</span>
+      <pre>${esc(JSON.stringify(s.specs))}</pre>`;
+  }
+}
+
+/* ---------- 播放 ---------- */
+function seek(n) {
+  const T = Math.min(...panels.map(p => p.T));
+  t = Math.max(0, Math.min(T - 1, n)); drawAll();
+}
+function play() {
+  if (!panels.length) return;
+  const T = Math.min(...panels.map(p => p.T));
+  if (t >= T - 1) t = 0;
+  timer = setInterval(() => {
+    if (t >= T - 1) { if ($('#loop').checked) t = 0; else { pause(); return; } } else t++;
+    drawAll();
+  }, 1000 / +$('#speed').value);
+  updateBar();
+}
+function pause() { if (timer) { clearInterval(timer); timer = null; } updateBar(); }
+function togglePlay() { timer ? pause() : play(); }
+
+init().then(() => {   // 可选：地址后加 #t=40 直接跳到某一帧
+  const m = location.hash.match(/t=(\d+)/); if (m) seek(+m[1]);
+}).catch(e => msg('初始化失败：' + e.message));
+</script>
+</body>
+</html>
