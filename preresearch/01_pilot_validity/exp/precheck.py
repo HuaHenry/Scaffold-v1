@@ -77,8 +77,8 @@ def _train(args, out):
 
 def check_2(data: Path, device: str, small: bool, work: Path) -> dict:
     extra = ["--depth", "2", "--dim", "96", "--heads", "2"] if small else []
-    done = _train(["--condition", "state", "--episodes", "1", "--steps", "500", "--val-every", "0",
-                   "--data", str(data), "--device", device, *extra], work / "check2_overfit")
+    done = _train(["--condition", "state", "--episodes", "1", "--steps", "500", "--warmup", "100",
+                   "--val-every", "0", "--data", str(data), "--device", device, *extra], work / "check2_overfit")
     acc = done["train_raw"]["chg_acc"]
     return {"changed_cell_acc": acc, "threshold": 0.99, "pass": acc >= 0.99}
 

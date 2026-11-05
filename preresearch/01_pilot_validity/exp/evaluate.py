@@ -57,8 +57,8 @@ def score_bench(bench: dict, tf: np.ndarray, tb: np.ndarray, with_violations: bo
             rate32[i, k] = metrics.change_rate(S, P(HORIZON - 1))
             pred_fg[i, k], pred_bg[i, k] = Pfp
     valid = bench["rank_valid"]
-    ra = np.array([metrics.rank_acc(*rate[i]) for i in range(N)])
-    ra32 = np.array([metrics.rank_acc(*rate32[i]) for i in range(N)])
+    ra = np.array([metrics.rank_acc(*rate[i], *bench["labels"][i]) for i in range(N)])
+    ra32 = np.array([metrics.rank_acc(*rate32[i], *bench["labels"][i]) for i in range(N)])
     s["rank_acc"] = np.where(valid, ra, np.nan)
     s["rank_acc__32"] = np.where(valid, ra32, np.nan)
     s["rate"], s["fp_step"] = rate, fp.astype(np.int16)

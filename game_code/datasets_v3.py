@@ -750,6 +750,10 @@ def bench_candidates(fg, bg, rng, wseed):
     return out
 
 
+def randomized_pair_order(pair, rng):
+    return pair[::-1] if rng.getrandbits(1) else pair
+
+
 def sample_bench_item(split, seed, i, attempt, exclude):
     rng = rng_for(seed, "bench", split, i, attempt)
     cfg = BENCH_SPLITS[split]
@@ -797,7 +801,7 @@ def sample_bench_item(split, seed, i, attempt, exclude):
     valid = [p for p in pairs if gap(p) >= RANK_MARGIN]
     pool = same or valid or pairs
     best = max(pool, key=lambda p: (gap(p), -p[0], -p[1]))
-    pair = [runs[best[0]], runs[best[1]]]
+    pair = randomized_pair_order([runs[best[0]], runs[best[1]]], rng)
     return {"fg": fg, "bg": bg, "pair": pair, "rank_valid": bool(gap(best) >= RANK_MARGIN), "scene": scene,
             "hash": h}
 
@@ -944,28 +948,30 @@ def audit(out: Path) -> dict:
     shortcut = []
     for sid, split in enumerate(meta["splits"]):
         idx = np.where(b["split_ids"] == sid)[0]
+        main = b["labels"][idx].argmax(axis=1)
         acc = {k: [] for k in rows}
-        for i in idx:
+        for i, k_main in zip(idx, main):
             fg, bg = b["ctx_fg"][i], b["ctx_bg"][i]
             if state_hash(fg, bg) in hashes:
                 bench["leak_with_train_finals"] += 1
-            iv = meta["interventions"][i][0]
+            iv = meta["interventions"][i][k_main]
             for k in acc:
-                acc[k].append(baseline_scores(fg, bg, iv, b["fut_fg"][i, 0, -1], b["fut_bg"][i, 0, -1], k))
+                acc[k].append(baseline_scores(fg, bg, iv, b["fut_fg"][i, k_main, -1], b["fut_bg"][i, k_main, -1], k))
             if b["rank_valid"][i]:
                 n0, n1 = (len(iv_actions(meta["interventions"][i][j])) for j in (0, 1))
-                shortcut.append(1.0 if n0 > n1 else 0.5 if n0 == n1 else 0.0)
+                shortcut.append(0.5 if n0 == n1 else float((n0 > n1) == (b["labels"][i, 0] > b["labels"][i, 1])))
         lab = b["labels"][idx]
         ivk = [meta["interventions"][i][j]["kind"] for i in idx for j in (0, 1)]
+        cascade_main = b["cascade"][idx, main]
         bench["splits"][split] = {
             "n": int(len(idx)), "mean_label": float(lab.mean()), "rank_valid_rate": float(b["rank_valid"][idx].mean()),
-            "mean_cascade_main": float(b["cascade"][idx, 0].mean()),
-            "frac_cascade_ge4": float((b["cascade"][idx, 0] >= 4).mean()),
-            "frac_cascade_ge8": float((b["cascade"][idx, 0] >= 8).mean()),
-            "frac_cascade_ge16": float((b["cascade"][idx, 0] >= 16).mean()),
-            "mean_depth_main": float(b["depth"][idx, 0].mean()), "mean_cells_changed_main": float(b["n_changed"][idx, 0].mean()),
+            "mean_cascade_main": float(cascade_main.mean()),
+            "frac_cascade_ge4": float((cascade_main >= 4).mean()),
+            "frac_cascade_ge8": float((cascade_main >= 8).mean()),
+            "frac_cascade_ge16": float((cascade_main >= 16).mean()),
+            "mean_depth_main": float(b["depth"][idx, main].mean()), "mean_cells_changed_main": float(b["n_changed"][idx, main].mean()),
             "gt_violations": int(b["violations"][idx].sum()),
-            "intervention_kinds": cnt(ivk), "main_kinds": cnt([meta["interventions"][i][0]["kind"] for i in idx]),
+            "intervention_kinds": cnt(ivk), "main_kinds": cnt([meta["interventions"][i][k]["kind"] for i, k in zip(idx, main)]),
             "mean_structs": float(np.mean([len(meta["scenes"][i]["kinds"]) for i in idx])),
             "scene_counts": cnt([meta["scene_kinds"][i] for i in idx]),
             "baselines": {k: {m: float(np.mean([r[m] for r in v])) for m in v[0]} for k, v in acc.items()}}

@@ -59,9 +59,11 @@ def short_scores(P, T, S, A) -> dict:
     return {"change_f1": _f1(pc, tc), "cascade_f1": _f1(pc & ~A, tc & ~A)}
 
 
-def rank_acc(p0, p1):
-    """Ranking accuracy of one sample from the two independently predicted change rates."""
-    return float(p0 > p1) + 0.5 * float(p0 == p1)
+def rank_acc(p0, p1, t0, t1):
+    """Rank two predicted change rates against the ground-truth intervention order."""
+    if p0 == p1 or t0 == t1:
+        return 0.5
+    return float((p0 > p1) == (t0 > t1))
 
 
 def change_rate(S, P) -> float:

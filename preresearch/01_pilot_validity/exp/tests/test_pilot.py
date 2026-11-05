@@ -86,10 +86,41 @@ def test_bench_loader_and_intervention_cells():
 
 # ---------------------------------------------------------------- metrics / baselines
 def test_rank_acc_constant_and_random_predictions_near_half():
-    assert metrics.rank_acc(0.2, 0.2) == 0.5 and metrics.rank_acc(0.3, 0.1) == 1.0 and metrics.rank_acc(0.1, 0.3) == 0.0
+    assert metrics.rank_acc(0.2, 0.2, 0.3, 0.1) == 0.5
+    assert metrics.rank_acc(0.3, 0.1, 0.3, 0.1) == 1.0
+    assert metrics.rank_acc(0.1, 0.3, 0.3, 0.1) == 0.0
+    assert metrics.rank_acc(0.1, 0.3, 0.1, 0.3) == 1.0
+    assert metrics.rank_acc(0.3, 0.1, 0.1, 0.3) == 0.0
     rng = np.random.default_rng(0)
-    r = np.mean([metrics.rank_acc(*rng.random(2)) for _ in range(4000)])
+    r = np.mean([metrics.rank_acc(*rng.random(2), 0.3, 0.1) for _ in range(4000)])
     assert abs(r - 0.5) < 0.03
+
+
+def test_new_bench_randomizes_rank_order():
+    import datasets_v3 as v3
+
+    class FixedBit:
+        def __init__(self, value):
+            self.value = value
+
+        def getrandbits(self, n):
+            assert n == 1
+            return self.value
+
+    pair = [{"label": 0.8}, {"label": 0.2}]
+    assert v3.randomized_pair_order(pair, FixedBit(0)) == pair
+    assert v3.randomized_pair_order(pair, FixedBit(1)) == pair[::-1]
+    assert pair[0]["label"] > pair[1]["label"]
+
+
+@needs_data
+def test_rank_score_uses_true_labels_in_either_order():
+    from exp.evaluate import score_bench
+
+    b = common.select_bench(common.load_bench(), "id", 1)
+    assert score_bench(b, b["fut_fg"], b["fut_bg"], False)["rank_acc"][0] == 1
+    flipped_labels = {**b, "labels": b["labels"][:, ::-1]}
+    assert score_bench(flipped_labels, b["fut_fg"], b["fut_bg"], False)["rank_acc"][0] == 0
 
 
 @needs_data
