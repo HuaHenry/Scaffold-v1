@@ -34,8 +34,12 @@ def get_args(argv=None):
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--protocol", default="video", choices=("video", "causal"))
     ap.add_argument("--data", type=Path, default=common.DEFAULT_DATA, help="v3 data dir (train_*.npz)")
-    ap.add_argument("--val", type=Path, default=common.DEFAULT_VAL, help="validation dir (monitoring only)")
-    ap.add_argument("--steps", type=int, default=6000)
+    ap.add_argument("--val", type=Path, default=common.DEFAULT_VAL, help="validation dir (monitoring or checkpoint selection)")
+    ap.add_argument("--select-best-val", action="store_true",
+                    help="select earliest EMA checkpoint maximizing validation cascade accuracy; never use bench")
+    ap.add_argument("--steps", type=int, default=None, help="fixed updates (default: 6000); with --epochs must match the derived count")
+    ap.add_argument("--epochs", type=int, default=None,
+                    help="full shuffled, no-replacement passes over all valid transitions; retain partial batches")
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--out", type=Path, default=None, help="result folder (default: new timestamped folder)")
     ap.add_argument("--id", default=None, help="logical run id, default <condition>[_<tag>]_s<seed>")
@@ -56,6 +60,8 @@ def get_args(argv=None):
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--log-batch-composition", action="store_true",
                     help="log the share of formation (phase==0) transitions per batch")
+    ap.add_argument("--balanced-phases", action="store_true",
+                    help="draw exactly half the batch from formation and half from operation video pairs")
     ap.add_argument("--device", default="auto", help="auto | cuda | cpu | mps")
     return ap.parse_args(argv)
 
@@ -131,6 +137,11 @@ def transition_accuracy(model, data: Data, pairs=None, max_n: int | None = None,
     return {"chg_acc": c_ok / max(1, c_n), "cascade_acc": k_ok / max(1, k_n), "n_changed": c_n, "n_cascade": k_n}
 
 
+def better_validation(candidate: dict, best: dict | None) -> bool:
+    """Earliest checkpoint wins ties; one-step cascade accuracy is a validation proxy."""
+    return best is None or candidate["cascade_acc"] > best["cascade_acc"]
+
+
 def lr_at(step, a):
     if step <= a.warmup:
         return a.lr * step / max(1, a.warmup)
@@ -138,9 +149,55 @@ def lr_at(step, a):
     return a.lr_min + 0.5 * (a.lr - a.lr_min) * (1 + math.cos(math.pi * min(1.0, p)))
 
 
+def phase_pools(pairs, phase, batch):
+    if batch % 2:
+        raise ValueError("balanced-phases requires an even batch size")
+    formation = torch.nonzero(phase[pairs[:, 0], pairs[:, 1]] == 0, as_tuple=True)[0]
+    operation = torch.nonzero(phase[pairs[:, 0], pairs[:, 1]] == 1, as_tuple=True)[0]
+    if not len(formation) or not len(operation):
+        raise ValueError("balanced-phases requires both formation and operation pairs")
+    return formation, operation
+
+
+def sample_batch(pairs, batch, generator, pools=None):
+    if pools is None:
+        return torch.randint(len(pairs), (batch,), device=pairs.device, generator=generator)
+    half = batch // 2
+    return torch.cat(tuple(pool[torch.randint(len(pool), (half,), device=pairs.device, generator=generator)]
+                           for pool in pools))
+
+
+def epoch_batches(count: int, batch: int, generator: torch.Generator, device: torch.device):
+    """One complete shuffled pass: each index once, including the final short batch."""
+    permutation = torch.randperm(count, generator=generator, device=device)
+    for start in range(0, count, batch):
+        yield permutation[start:start + batch]
+
+
+def validation_due(step: int, total_steps: int, every: int, steps_per_epoch: int | None) -> bool:
+    if steps_per_epoch is not None:
+        return step % steps_per_epoch == 0
+    return every > 0 and (step % every == 0 or step == total_steps)
+
+
 def main(argv=None) -> dict:
     a = get_args(argv)
     a.data, a.val = resolve(a.data), resolve(a.val)
+    if a.batch <= 0 or (a.epochs is not None and a.epochs <= 0):
+        raise ValueError("batch and epochs must be positive")
+    if a.epochs is not None:
+        if a.protocol != "video" or a.unroll != 1 or a.balanced_phases:
+            raise ValueError("full epochs require video, unroll=1, and no balanced replacement sampling")
+        pair_count = len(common.make_pairs(a.data, a.condition, a.protocol, a.episodes))
+        expected_steps = a.epochs * math.ceil(pair_count / a.batch)
+        if a.steps is not None and a.steps != expected_steps:
+            raise ValueError(f"--steps must equal {expected_steps} for {a.epochs} complete epochs")
+        a.steps = expected_steps
+        a.warmup = min(a.warmup, max(1, a.steps // 20))
+    else:
+        a.steps = 6000 if a.steps is None else a.steps
+    if a.steps <= 0:
+        raise ValueError("steps must be positive")
     a.id = a.id or f"{a.condition}{'_' + a.tag if a.tag else ''}_s{a.seed}"
     n_ep = a.episodes or common.load_summary(a.data)["conditions"][a.condition]["episodes"]
     sett = common.train_settings(n_ep, a.protocol, a.steps, a.batch, a.lr, a.change_weight, a.depth, a.unroll)
@@ -148,7 +205,7 @@ def main(argv=None) -> dict:
     a.out.mkdir(parents=True, exist_ok=True)
     common.write_meta(a.out, "train", a.id, {
         "condition": a.condition, "seed": a.seed, "protocol": a.protocol, "episodes": n_ep, "steps": a.steps,
-        "batch": a.batch, "lr": a.lr, "change_weight": a.change_weight, "depth": a.depth, "unroll": a.unroll,
+        "epochs": a.epochs, "batch": a.batch, "lr": a.lr, "change_weight": a.change_weight, "depth": a.depth, "unroll": a.unroll,
         "tag": a.tag, "data": common.bench_label(a.data / "bench.npz")})
     dev = pick_device(a.device)
     use_amp = dev.type == "cuda"
@@ -161,12 +218,17 @@ def main(argv=None) -> dict:
     pairs = data.chain_pairs(a.unroll)
     if len(pairs) == 0:
         sys.exit("no training transitions")
+    if a.epochs is not None and len(pairs) != pair_count:
+        raise ValueError("epoch transition count differs from the requested training data")
+    pools = phase_pools(pairs, data.phase, a.batch) if a.balanced_phases else None
     val = None
     if a.val_every > 0 and (a.val / "train_state.npz").exists():
         val = Data(a.val, "state", "video", None, dev)
     elif a.val_every > 0:
         print(f"[warn] validation set {a.val} not found, skipping validation (run: python -m exp.gen_val)",
               flush=True)
+    if a.select_best_val and val is None:
+        raise ValueError("--select-best-val requires --val-every > 0 and a valid validation dataset")
 
     model = build_model({"dim": a.dim, "depth": a.depth, "heads": a.heads}).to(dev)
     ema = copy.deepcopy(model).eval()
@@ -179,7 +241,9 @@ def main(argv=None) -> dict:
 
     cfg = {"args": {k: common.rel(v) if isinstance(v, Path) else v for k, v in vars(a).items()},
            "n_pairs": int(len(pairs)), "n_params": n_params(model), "episodes_used": data.E,
-           "data_sha1": common.data_hashes(a.data, a.condition), "git_rev": common.git_rev(),
+           "data_sha1": common.data_hashes(a.data, a.condition),
+           "val_sha1": common.data_hashes(a.val, "state") if a.select_best_val else None,
+           "git_rev": common.git_rev(),
            "torch": torch.__version__, "device": str(dev),
            "device_name": torch.cuda.get_device_name(0) if dev.type == "cuda" else "cpu",
            "formation_share_of_pairs": float((data.phase[pairs[:, 0], pairs[:, 1]] == 0).float().mean())}
@@ -194,12 +258,23 @@ def main(argv=None) -> dict:
     form_total, form_n = 0.0, 0
     t0 = time.time()
     last_val: dict = {}
+    best_val: dict | None = None
+    best_step = None
+    steps_per_epoch = math.ceil(len(pairs) / a.batch) if a.epochs is not None else None
+    epoch_iter = None
+    seen = 0
     for step in range(1, a.steps + 1):
         model.train()
         lr = lr_at(step, a)
         for grp in opt.param_groups:
             grp["lr"] = lr
-        idx = torch.randint(len(pairs), (a.batch,), device=dev, generator=g)
+        if a.epochs is not None:
+            if (step - 1) % steps_per_epoch == 0:
+                epoch_iter = iter(epoch_batches(len(pairs), a.batch, g, pairs.device))
+            idx = next(epoch_iter)
+        else:
+            idx = sample_batch(pairs, a.batch, g, pools)
+        seen += len(idx)
         e, t = pairs[idx, 0], pairs[idx, 1]
         cur_f, cur_b = data.fg[e, t - 1].long(), data.bg[e, t - 1].long()
         loss = 0.0
@@ -227,14 +302,15 @@ def main(argv=None) -> dict:
         acc_loss = acc_loss + loss.detach()
         acc_cacc = acc_cacc + cacc.detach()
         if a.log_batch_composition:
-            acc_form = acc_form + (data.phase[e, t] == 0).float().mean()
+            batch_form = (data.phase[e, t] == 0).sum()
+            acc_form = acc_form + batch_form.float() / len(idx)
+            form_total += int(batch_form)
+            form_n += len(idx)
         n_acc += 1
         if step % a.log_every == 0 or step == a.steps:
             rec = {"step": step, "loss": float(acc_loss) / n_acc, "chg_acc": float(acc_cacc) / n_acc, "lr": lr}
             if a.log_batch_composition:
                 rec["form_frac"] = float(acc_form) / n_acc
-                form_total += rec["form_frac"] * n_acc
-                form_n += n_acc
             log.write(json.dumps(rec) + "\n")
             log.flush()
             acc_loss = acc_cacc = acc_form = torch.zeros((), device=dev)
@@ -242,21 +318,36 @@ def main(argv=None) -> dict:
             if step % (a.log_every * 10) == 0:
                 print(f"[train] step {step}/{a.steps} loss {rec['loss']:.4f} chg_acc {rec['chg_acc']:.3f} "
                       f"({time.time() - t0:.0f}s)", flush=True)
-        if val is not None and (step % a.val_every == 0 or step == a.steps):
+        if val is not None and validation_due(step, a.steps, a.val_every, steps_per_epoch):
             last_val = transition_accuracy(ema, val)
-            log.write(json.dumps({"step": step, "type": "val", **{f"val_{k}": v for k, v in last_val.items()}}) + "\n")
+            rec = {"step": step, "type": "val", **{f"val_{k}": v for k, v in last_val.items()}}
+            if a.epochs is not None:
+                rec["epoch"] = step // steps_per_epoch
+            log.write(json.dumps(rec) + "\n")
             log.flush()
             print(f"[val] step {step} chg_acc {last_val['chg_acc']:.3f} cascade_acc {last_val['cascade_acc']:.3f}",
                   flush=True)
+            if a.select_best_val and better_validation(last_val, best_val):
+                best_val, best_step = last_val.copy(), step
+                checkpoint = {"model": model.state_dict(), "ema": ema.state_dict(), "cfg": model.cfg,
+                              "step": step, "args": cfg["args"], "selection": "val_cascade_acc"}
+                torch.save(checkpoint, a.out / "ckpt.tmp")
+                (a.out / "ckpt.tmp").replace(a.out / "ckpt.pt")
     log.close()
 
-    torch.save({"model": model.state_dict(), "ema": ema.state_dict(), "cfg": model.cfg, "step": a.steps,
-                "args": cfg["args"]}, a.out / "ckpt.pt")
-    done = {"steps": a.steps, "seconds": time.time() - t0, "n_pairs": int(len(pairs)),
-            "val": last_val, "train_raw": transition_accuracy(model, data, max_n=4096),
+    if not a.select_best_val:
+        torch.save({"model": model.state_dict(), "ema": ema.state_dict(), "cfg": model.cfg, "step": a.steps,
+                    "args": cfg["args"]}, a.out / "ckpt.pt")
+    done = {"steps": a.steps, "epochs": a.epochs, "steps_per_epoch": steps_per_epoch,
+            "samples_seen": seen, "seconds": time.time() - t0, "n_pairs": int(len(pairs)),
+            "val": last_val, "best_val": best_val, "best_step": best_step,
+            "selection": "val_cascade_acc" if a.select_best_val else "last",
+            "train_raw": transition_accuracy(model, data, max_n=4096),
             "train_ema": transition_accuracy(ema, data, max_n=4096)}
     if form_n:
         done["form_frac_mean"] = form_total / form_n
+    if a.select_best_val:
+        done["ckpt_sha1"] = common.sha1_file(a.out / "ckpt.pt")
     common.dump_json(done, a.out / "done.json")
     print(f"[train] done in {done['seconds']:.0f}s -> {common.rel(a.out)}", flush=True)
     return done

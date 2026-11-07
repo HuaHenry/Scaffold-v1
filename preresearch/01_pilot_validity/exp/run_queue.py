@@ -26,14 +26,64 @@ def _cmd(cmd):
     return [sys.executable if c == "python" else c for c in cmd]
 
 
+def validate_curve_resume(job, out, bench_args):
+    """Reject stale 07 completion/evaluation artifacts rather than silently skipping them."""
+    cmd = job["cmd"]
+    if "--select-best-val" not in cmd:
+        return
+    if not (out / "done.json").exists():
+        if (out / "eval.json").exists():
+            raise ValueError("evaluation exists without completed training")
+        return
+    cfg = common.load_json(out / "config.json")
+    args = cfg["args"]
+    done = common.load_json(out / "done.json")
+    for flag in ("condition", "seed", "protocol", "steps", "batch", "episodes", "lr",
+                 "change-weight", "depth", "data", "val", "val-every"):
+        key = flag.replace("-", "_")
+        actual = cmd[cmd.index("--" + flag) + 1]
+        if str(args[key]) != actual and not (key == "lr" and float(args[key]) == float(actual)):
+            raise ValueError(f"completed job changed {flag}")
+    epochs = int(cmd[cmd.index("--epochs") + 1]) if "--epochs" in cmd else None
+    if args.get("epochs") != epochs or (epochs is not None and
+            (args["balanced_phases"] or done.get("epochs") != epochs
+             or done.get("n_pairs") != (56 if args["condition"] == "state" else 59) * args["episodes"]
+             or done.get("samples_seen") != epochs * done["n_pairs"]
+             or done.get("steps_per_epoch") != (done["n_pairs"] + args["batch"] - 1) // args["batch"]
+             or done.get("steps") != epochs * done["steps_per_epoch"]
+             or done.get("best_step") not in [k * done["steps_per_epoch"] for k in range(1, epochs + 1)])):
+        raise ValueError("completed job differs from the full-epoch sampling protocol")
+    if (not args["select_best_val"] or args["balanced_phases"] != (epochs is None and args["condition"] == "process")
+            or done.get("selection") != "val_cascade_acc" or done.get("best_step") is None
+            or not (out / "ckpt.pt").is_file()
+            or done.get("ckpt_sha1") != common.sha1_file(out / "ckpt.pt")
+            or cfg.get("data_sha1") != common.data_hashes(common.resolve(args["data"]), args["condition"])
+            or cfg.get("val_sha1") != common.data_hashes(common.resolve(args["val"]), "state")):
+        raise ValueError("completed job checkpoint or input identity changed")
+    if (out / "eval.json").exists():
+        ev = common.load_json(out / "eval.json")
+        bench = resolve(bench_args[1])
+        if (ev.get("checkpoint_sha1") != done["ckpt_sha1"] or ev.get("bench") != common.rel(bench)
+                or ev.get("bench_sha1") != common.sha1_file(bench)
+                or ev.get("bench_json_sha1") != common.sha1_file(bench.with_suffix(".json"))):
+            raise ValueError("completed evaluation has different checkpoint or bench")
+
+
 def run_job(job: dict, gpu: str, eval_after: bool, bench_args: list[str], log) -> bool:
     out = common.resolve_out(job["out"])
     out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="" if gpu == "cpu" else gpu, PYTHONUNBUFFERED="1")
+    try:
+        if "--select-best-val" in job["cmd"] and eval_after and not bench_args:
+            raise ValueError("experiment 07 requires an explicit audited --bench")
+        validate_curve_resume(job, out, bench_args)
+    except (ValueError, KeyError, IndexError, FileNotFoundError) as exc:
+        log(f"FAILED  {job['name']} [resume] {exc}")
+        return False
     stages = []
     if not (out / "done.json").exists():
         stages.append(("train", job["cmd"]))
-    if eval_after and not (out / "eval.json").exists():
+    if eval_after and (not (out / "eval.json").exists() or not (out / "eval_samples.npz").exists()):
         stages.append(("eval", ["python", "-m", "exp.evaluate", "--run", str(out), "--splits", "all", *bench_args]))
     for stage, cmd in stages:
         (out / "failed.json").unlink(missing_ok=True)

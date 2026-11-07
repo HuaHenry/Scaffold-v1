@@ -1,0 +1,9 @@
+{
+  "G1_formation_gain": 0.15,
+  "G1_operation_abs_max": 0.03,
+  "G2_shuffle_gain": 0.05,
+  "C_cascade_coverage_gain": 0.02,
+  "C_window": "3x3",
+  "bootstrap_samples": 10000,
+  "bootstrap_seed": 12345
+}

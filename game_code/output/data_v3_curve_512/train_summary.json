@@ -1,0 +1,77 @@
+{
+  "schema": "formworld.dataset.v3",
+  "seed": 0,
+  "grid": [
+    28,
+    56
+  ],
+  "cell": 2,
+  "layout": {
+    "formation": 32,
+    "clip": 8,
+    "state_clips": 8,
+    "mixed_clips": 4
+  },
+  "builder": {
+    "p_mistake": 0.08,
+    "scaffold": true
+  },
+  "conditions": {
+    "state": {
+      "episodes": 512,
+      "frames_per_episode": 64,
+      "total_frames": 32768,
+      "fg_shape": [
+        512,
+        64,
+        28,
+        56
+      ],
+      "continuous_transitions": 28672,
+      "reset_frames": 4096,
+      "formation_frames": 0
+    },
+    "process": {
+      "episodes": 512,
+      "frames_per_episode": 64,
+      "total_frames": 32768,
+      "fg_shape": [
+        512,
+        64,
+        28,
+        56
+      ],
+      "continuous_transitions": 30208,
+      "reset_frames": 2560,
+      "formation_frames": 16384
+    },
+    "partial": {
+      "episodes": 512,
+      "frames_per_episode": 64,
+      "total_frames": 32768,
+      "fg_shape": [
+        512,
+        64,
+        28,
+        56
+      ],
+      "continuous_transitions": 28672,
+      "reset_frames": 4096,
+      "formation_frames": 0
+    },
+    "shuffle": {
+      "episodes": 512,
+      "frames_per_episode": 64,
+      "total_frames": 32768,
+      "fg_shape": [
+        512,
+        64,
+        28,
+        56
+      ],
+      "continuous_transitions": 14336,
+      "reset_frames": 18432,
+      "formation_frames": 16384
+    }
+  }
+}

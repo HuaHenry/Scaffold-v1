@@ -135,7 +135,11 @@ def evaluate_run(run_dir: Path, bench_path, splits, limit, tag, batch, device_na
     samples = score_bench(bench, tf, tb)
     summary = summarize(samples, bench)
     out = run_dir / f"eval{tag}.json"
-    common.dump_json({"run": common.rel(run_dir), "bench": common.rel(bench_path), "seconds": time.time() - t0, **summary}, out)
+    common.dump_json({"run": common.rel(run_dir), "bench": common.rel(bench_path),
+                      "bench_sha1": common.sha1_file(bench_path),
+                      "bench_json_sha1": common.sha1_file(Path(bench_path).with_suffix(".json")),
+                      "checkpoint_sha1": common.sha1_file(run_dir / "ckpt.pt"),
+                      "seconds": time.time() - t0, **summary}, out)
     np.savez_compressed(run_dir / f"eval_samples{tag}.npz", **samples)
     return summary
 
