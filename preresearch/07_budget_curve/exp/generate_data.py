@@ -8,25 +8,28 @@ from pathlib import Path
 import numpy as np
 
 from .shared import PACKAGE, common
-from datasets_v3 import generate_train, generate_bench, state_hash
+from datasets_v3 import GenerationProgress, generate_train, generate_bench, state_hash
 
 
 def check_prefix(original, extended):
     """Assert that every old video, action script, and scene occupies the identical new prefix."""
-    old = common.load_json(original / "train_scenes.json")
-    new = common.load_json(extended / "train_scenes.json")
-    n = len(old)
-    if new[:n] != old:
-        raise ValueError("extended dataset changed old scene descriptions or hashes")
+    with GenerationProgress(f"check prefix scenes {common.rel(original)} -> {common.rel(extended)}"):
+        old = common.load_json(original / "train_scenes.json")
+        new = common.load_json(extended / "train_scenes.json")
+        n = len(old)
+        if new[:n] != old:
+            raise ValueError("extended dataset changed old scene descriptions or hashes")
     for cond in common.CONDITIONS:
         with np.load(original / f"train_{cond}.npz") as a, np.load(extended / f"train_{cond}.npz") as b:
             for key in ("fg", "bg", "cont", "phase"):
-                if not np.array_equal(a[key], b[key][:n]):
-                    raise ValueError(f"{cond} {key}: regenerated prefix differs from original")
-        a = common.load_json(original / f"train_{cond}_actions.json")
-        b = common.load_json(extended / f"train_{cond}_actions.json")
-        if a["actions"] != b["actions"][:n] or a["extra"] != b["extra"][:n]:
-            raise ValueError(f"{cond}: regenerated actions or extra differ from original")
+                with GenerationProgress(f"check prefix {cond}.{key} ({n} episodes)"):
+                    if not np.array_equal(a[key], b[key][:n]):
+                        raise ValueError(f"{cond} {key}: regenerated prefix differs from original")
+        with GenerationProgress(f"check prefix {cond} actions/extra ({n} episodes)"):
+            a = common.load_json(original / f"train_{cond}_actions.json")
+            b = common.load_json(extended / f"train_{cond}_actions.json")
+            if a["actions"] != b["actions"][:n] or a["extra"] != b["extra"][:n]:
+                raise ValueError(f"{cond}: regenerated actions or extra differ from original")
     return n
 
 
@@ -34,7 +37,11 @@ def input_hashes(directory):
     names = ["train_summary.json", "train_scenes.json", "train_finals.npz"]
     names += [f"train_{c}{suffix}" for c in common.CONDITIONS
               for suffix in (".npz", "_actions.json")]
-    return {name: common.sha1_file(directory / name) for name in names}
+    hashes = {}
+    for i, name in enumerate(names, 1):
+        with GenerationProgress(f"hash {common.rel(directory)} [{i}/{len(names)}] {name}"):
+            hashes[name] = common.sha1_file(directory / name)
+    return hashes
 
 
 def prepare_validation(data, val, workers, extra=64):
@@ -42,17 +49,22 @@ def prepare_validation(data, val, workers, extra=64):
     if not (val / "train_summary.json").is_file():
         if val.exists() and any(val.iterdir()):
             raise ValueError(f"incomplete validation directory: {val}; select an empty --val directory")
+        print(f"[data] generate validation: {32 + extra} candidates -> 32 episodes, out={common.rel(val)}",
+              flush=True)
         import_module(f"{PACKAGE}.gen_val").main([
             "--data", str(data), "--out", str(val), "--episodes", "32", "--extra", str(extra),
             "--seed", "1000", "--workers", str(workers)])
+    else:
+        print(f"[data] reuse validation: {common.rel(val)}; checking hashes", flush=True)
     return input_hashes(val)
 
 
 def disjoint_scenes(data, val):
-    train = {row["final_hash"] for row in common.load_json(data / "train_scenes.json")}
-    validation = {row["final_hash"] for row in common.load_json(val / "train_scenes.json")}
-    if train & validation:
-        raise ValueError(f"validation {val} overlaps expanded training; use an empty separate --val directory")
+    with GenerationProgress("check training/validation scene separation"):
+        train = {row["final_hash"] for row in common.load_json(data / "train_scenes.json")}
+        validation = {row["final_hash"] for row in common.load_json(val / "train_scenes.json")}
+        if train & validation:
+            raise ValueError(f"validation {val} overlaps expanded training; use an empty separate --val directory")
     return train, validation
 
 
@@ -72,6 +84,8 @@ def build(source, out, val, episodes=4096, workers=0, prefix_source=None, val_ex
         raise ValueError(f"unknown data profile: {profile}")
     source, out, val = map(Path, (source, out, val))
     prefix_source = Path(prefix_source) if prefix_source is not None else None
+    print(f"[data] build profile={profile} episodes={episodes} workers={workers} out={common.rel(out)}",
+          flush=True)
     if prefix_source is not None and prefix_source.resolve() == out.resolve():
         raise ValueError("prefix source must not be the output directory")
     if profile == "simple_to_complex" and prefix_source is not None:
@@ -97,6 +111,8 @@ def build(source, out, val, episodes=4096, workers=0, prefix_source=None, val_ex
                            profile=profile, p_mistake=0.0, scaffold=False)
         else:
             generate_train(out, episodes, 64, 0, workers, F=32)
+    else:
+        print(f"[data] reuse complete training dataset: {common.rel(out)}; rechecking all inputs", flush=True)
     summary = common.load_summary(out)
     if (summary["seed"] != 0 or summary["layout"] != old["layout"]
             or (summary.get("profile", "v3") != profile)
@@ -117,7 +133,7 @@ def build(source, out, val, episodes=4096, workers=0, prefix_source=None, val_ex
     val_hashes = prepare_validation(out, val, workers, val_extra)
     train, validation = disjoint_scenes(out, val)
     old_bench = source / "bench.npz"
-    with np.load(old_bench) as z:
+    with GenerationProgress("check source bench scene hashes"), np.load(old_bench) as z:
         old_bench_hash = {state_hash(f, b) for f, b in zip(z["ctx_fg"], z["ctx_bg"])}
     if profile == "simple_to_complex":
         earlier_bench = prefix_source / "bench.npz" if prefix_source else None
@@ -143,11 +159,13 @@ def build(source, out, val, episodes=4096, workers=0, prefix_source=None, val_ex
     else:
         bench = old_bench
         bench_origin = "original v3 bench: still disjoint from expanded training"
-    with np.load(bench) as z:
+    print(f"[data] selected bench: {common.rel(bench)} ({bench_origin})", flush=True)
+    with GenerationProgress("check selected bench scene separation"), np.load(bench) as z:
         overlap = sum(state_hash(f, b) in (train | validation) for f, b in zip(z["ctx_fg"], z["ctx_bg"]))
     if overlap:
         raise ValueError(f"selected bench overlaps {overlap} training/validation scenes")
-    bench_hashes = {p.name: common.sha1_file(p) for p in (bench, bench.with_suffix(".json"))}
+    with GenerationProgress("hash selected bench provenance"):
+        bench_hashes = {p.name: common.sha1_file(p) for p in (bench, bench.with_suffix(".json"))}
     if provenance.exists() and previous.get("bench_sha1") != bench_hashes:
         raise ValueError("existing bench differs from frozen provenance")
     report = {"source": common.rel(source), "data": common.rel(out), "val": common.rel(val),

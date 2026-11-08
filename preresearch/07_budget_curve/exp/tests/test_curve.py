@@ -187,6 +187,98 @@ def test_partial_expansion_is_rejected(tmp_path):
         build(common.DEFAULT_DATA, tmp_path, common.DEFAULT_VAL, episodes=4096)
 
 
+@pytest.mark.parametrize("workers", (1, 2))
+@pytest.mark.parametrize("profile", ("v3", "simple_to_complex"))
+def test_train_progress_preserves_episode_data(tmp_path, capsys, workers, profile):
+    import datasets_v3 as v3
+
+    options = {"F": 32, "profile": profile}
+    if profile == "simple_to_complex":
+        options.update(p_mistake=0.0, scaffold=False)
+    summary = v3.generate_train(tmp_path, 2, 64, 0, workers=workers, **options)
+    expected = [v3.make_episode_set(0, i, **options) for i in range(2)]
+    assert common.load_json(tmp_path / "train_scenes.json") == v3.D._jsonable([e["meta"] for e in expected])
+    for cond in common.CONDITIONS:
+        with np.load(tmp_path / f"train_{cond}.npz") as arrays:
+            for key in ("fg", "bg", "cont", "phase"):
+                np.testing.assert_array_equal(arrays[key], np.stack([e["episodes"][cond][key] for e in expected]))
+        actions = common.load_json(tmp_path / f"train_{cond}_actions.json")
+        assert actions["actions"] == [e["episodes"][cond]["actions"] for e in expected]
+        assert actions["extra"] == v3.D._jsonable([
+            {k: e["episodes"][cond][k] for k in ("order", "picks") if k in e["episodes"][cond]}
+            for e in expected])
+        assert summary["conditions"][cond]["episodes"] == 2
+    with np.load(tmp_path / "train_finals.npz") as finals:
+        for i, key in enumerate(("fg", "bg")):
+            np.testing.assert_array_equal(finals[key], np.stack([e["final"][i] for e in expected]))
+    assert common.load_json(tmp_path / "train_summary.json") == summary
+    output = capsys.readouterr().out
+    assert "2/2 episodes (100.0%)" in output and "rate=" in output and "ETA=" in output
+    assert "assemble training arrays: done" in output
+    assert all(f"compress/write train_{c}.npz: done" in output for c in common.CONDITIONS)
+
+
+def test_progress_heartbeat_before_first_result_and_failure(monkeypatch, capsys):
+    from threading import Event
+    import datasets_v3 as v3
+
+    heartbeat = Event()
+    report = v3.GenerationProgress._report
+
+    def observe(self, status="running"):
+        report(self, status)
+        if status == "running":
+            heartbeat.set()
+
+    monkeypatch.setattr(v3.GenerationProgress, "_report", observe)
+    with pytest.raises(ValueError, match="worker failed"):
+        with v3.GenerationProgress("waiting", 3, "episodes", interval=.01) as progress:
+            assert heartbeat.wait(2)
+            raise ValueError("worker failed")
+    assert not progress._thread.is_alive()
+    output = capsys.readouterr().out
+    assert "waiting: running 0/3 episodes" in output
+    assert "ETA=unknown" in output and "waiting: failed" in output
+
+
+def test_parallel_progress_counts_completed_jobs_without_reordering(monkeypatch, capsys):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    import datasets_v3 as v3
+
+    release_first = Event()
+    advance = v3.GenerationProgress.advance
+
+    def observe(self, n=1):
+        advance(self, n)
+        release_first.set()
+
+    def worker(i):
+        if i == 0:
+            assert release_first.wait(2), "progress waited for the first job instead of the completed second job"
+        return i
+
+    monkeypatch.setattr(v3, "ProcessPoolExecutor", ThreadPoolExecutor)
+    monkeypatch.setattr(v3.GenerationProgress, "advance", observe)
+    assert v3._generate_results(worker, [0, 1], 2, "out of order", "episodes") == [0, 1]
+    assert "2/2 episodes (100.0%)" in capsys.readouterr().out
+
+
+def test_input_hash_progress_preserves_checksums(tmp_path, capsys):
+    mod = import_module("exp.generate_data")
+    names = ["train_summary.json", "train_scenes.json", "train_finals.npz"]
+    names += [f"train_{c}{suffix}" for c in common.CONDITIONS for suffix in (".npz", "_actions.json")]
+    for name in names:
+        (tmp_path / name).write_text(name)
+    expected = {name: common.sha1_file(tmp_path / name) for name in names}
+    assert mod.input_hashes(tmp_path) == expected
+    output = capsys.readouterr().out
+    assert "[1/11] train_summary.json: started" in output
+    assert "[11/11] train_shuffle_actions.json: done" in output
+    (tmp_path / names[0]).write_text("changed")
+    assert mod.input_hashes(tmp_path)[names[0]] != expected[names[0]]
+
+
 def test_expanded_validation_is_new_and_reused_without_overwriting(tmp_path, monkeypatch):
     mod = import_module("exp.generate_data")
     data, val = tmp_path / "data", tmp_path / "data" / "validation"

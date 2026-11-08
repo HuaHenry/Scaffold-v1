@@ -22,9 +22,11 @@ from __future__ import annotations
 import json
 import os
 import random
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from itertools import combinations
 from pathlib import Path
+from threading import Event, Lock, Thread
+from time import monotonic, strftime
 
 import numpy as np
 
@@ -675,6 +677,81 @@ def make_episode_set(seed: int, index: int, T: int = T_DEFAULT, F: int = F_FORM,
     return {"episodes": episodes, "meta": meta, "final": (final_fg, final_bg)}
 
 
+def _duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+class GenerationProgress:
+    def __init__(self, label, total=None, unit="items", interval=10.0):
+        self.label, self.total, self.unit, self.interval = label, total, unit, interval
+        self.completed = 0
+        self._stop, self._lock = Event(), Lock()
+
+    def _report(self, status="running"):
+        with self._lock:
+            elapsed = monotonic() - self.started
+            details = f"elapsed={_duration(elapsed)}"
+            if self.total is not None:
+                rate = self.completed / elapsed if elapsed > 0 else 0
+                percent = 100 * self.completed / self.total if self.total else 100
+                eta = _duration((self.total - self.completed) / rate) if rate else "unknown"
+                details = (f"{self.completed}/{self.total} {self.unit} ({percent:.1f}%) "
+                           f"{details} rate={rate:.2f} {self.unit}/s ETA={eta}")
+            print(f"[data {strftime('%Y-%m-%d %H:%M:%S')}] {self.label}: {status} {details}", flush=True)
+
+    def _heartbeat(self):
+        while not self._stop.wait(self.interval):
+            self._report()
+
+    def __enter__(self):
+        self.started = monotonic()
+        self._report("started")
+        self._thread = Thread(target=self._heartbeat, daemon=True)
+        self._thread.start()
+        return self
+
+    def advance(self, n=1):
+        with self._lock:
+            self.completed += n
+            first = self.completed == n
+        if first:
+            self._report()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._stop.set()
+        self._thread.join()
+        self._report("failed" if exc_type else "done")
+
+
+def _generate_results(worker, jobs, workers, label, unit):
+    results = [None] * len(jobs)
+    if workers <= 1:
+        with GenerationProgress(label, len(jobs), unit) as progress:
+            for i, job in enumerate(jobs):
+                results[i] = worker(job)
+                progress.advance()
+    else:
+        with ProcessPoolExecutor(workers) as ex:
+            todo = iter(enumerate(jobs))
+            pending = {ex.submit(worker, job): i for i, job in
+                       (next(todo) for _ in range(min(len(jobs), 2 * workers)))}
+            with GenerationProgress(label, len(jobs), unit) as progress:
+                while pending:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        results[pending.pop(future)] = future.result()
+                        progress.advance()
+                    for _ in done:
+                        entry = next(todo, None)
+                        if entry is not None:
+                            i, job = entry
+                            pending[ex.submit(worker, job)] = i
+    return results
+
+
 def _train_worker(args):
     return args[1], make_episode_set(*args)
 
@@ -690,36 +767,39 @@ def generate_train(out: Path, episodes: int, T: int, seed: int, workers: int = 0
     jobs = [(seed, i, T, F, kw.get("n_clips"), kw.get("n_state_clips"), kw.get("p_mistake", DEFAULT_P),
              kw.get("scaffold", True)) + ((profile,) if profile != "v3" else ()) for i in range(episodes)]
     workers = workers or min(os.cpu_count() or 1, 10)
-    if workers > 1:
-        with ProcessPoolExecutor(workers) as ex:
-            results = dict(ex.map(_train_worker, jobs, chunksize=2))
-    else:
-        results = dict(map(_train_worker, jobs))
+    results = dict(_generate_results(_train_worker, jobs, workers,
+                                    f"generate train profile={profile} workers={workers} out={out}", "episodes"))
     cols = {c: {"fg": [], "bg": [], "cont": [], "phase": [], "actions": [], "extra": []} for c in CONDITIONS}
     metas, finals_fg, finals_bg = [], [], []
-    for i in range(episodes):
-        res = results[i]
-        metas.append(res["meta"])
-        finals_fg.append(res["final"][0])
-        finals_bg.append(res["final"][1])
-        for c in CONDITIONS:
-            ep = res["episodes"][c]
-            for key in ("fg", "bg", "cont", "phase", "actions"):
-                cols[c][key].append(ep[key])
-            cols[c]["extra"].append({k: ep[k] for k in ("order", "picks") if k in ep})
+    with GenerationProgress("assemble training arrays", episodes, "episodes") as progress:
+        for i in range(episodes):
+            res = results[i]
+            metas.append(res["meta"])
+            finals_fg.append(res["final"][0])
+            finals_bg.append(res["final"][1])
+            for c in CONDITIONS:
+                ep = res["episodes"][c]
+                for key in ("fg", "bg", "cont", "phase", "actions"):
+                    cols[c][key].append(ep[key])
+                cols[c]["extra"].append({k: ep[k] for k in ("order", "picks") if k in ep})
+            progress.advance()
     summary = {}
     for c in CONDITIONS:
-        arrays = {k: np.stack(cols[c][k]) for k in ("fg", "bg", "cont", "phase")}
-        np.savez_compressed(out / f"train_{c}.npz", **arrays)
-        (out / f"train_{c}_actions.json").write_text(json.dumps(
-            {"schema": SCHEMA, "condition": c, "scenes": [m["kind"] for m in metas],
-             "extra": D._jsonable(cols[c]["extra"]), "actions": cols[c]["actions"]}), encoding="utf-8")
+        with GenerationProgress(f"stack train_{c} arrays"):
+            arrays = {k: np.stack(cols[c][k]) for k in ("fg", "bg", "cont", "phase")}
+        with GenerationProgress(f"compress/write train_{c}.npz"):
+            np.savez_compressed(out / f"train_{c}.npz", **arrays)
+        with GenerationProgress(f"write train_{c}_actions.json"):
+            (out / f"train_{c}_actions.json").write_text(json.dumps(
+                {"schema": SCHEMA, "condition": c, "scenes": [m["kind"] for m in metas],
+                 "extra": D._jsonable(cols[c]["extra"]), "actions": cols[c]["actions"]}), encoding="utf-8")
         summary[c] = {"episodes": episodes, "frames_per_episode": T, "total_frames": episodes * T,
                       "fg_shape": list(arrays["fg"].shape), "continuous_transitions": int(arrays["cont"].sum()),
                       "reset_frames": int((~arrays["cont"]).sum()),
                       "formation_frames": int((arrays["phase"] == 0).sum())}
-    np.savez_compressed(out / "train_finals.npz", fg=np.stack(finals_fg), bg=np.stack(finals_bg))
-    (out / "train_scenes.json").write_text(json.dumps(D._jsonable(metas)), encoding="utf-8")
+    with GenerationProgress("compress/write train_finals.npz and train_scenes.json"):
+        np.savez_compressed(out / "train_finals.npz", fg=np.stack(finals_fg), bg=np.stack(finals_bg))
+        (out / "train_scenes.json").write_text(json.dumps(D._jsonable(metas)), encoding="utf-8")
     summary_all = {"schema": SCHEMA, "seed": seed, "grid": [DH, DW], "cell": CELL,
                    "layout": {"formation": F, "clip": CLIP, "state_clips": n_state, "mixed_clips": n_clips},
                    "builder": {"p_mistake": kw.get("p_mistake", DEFAULT_P), "scaffold": kw.get("scaffold", True)},
@@ -862,38 +942,38 @@ def generate_bench(out: Path, per_split: int, seed: int, exclude=None, workers: 
     jobs = [(split, seed, i, exclude) + ((profile,) if profile != "v3" else ())
             for split in BENCH_SPLITS for i in range(per_split)]
     workers = workers or min(os.cpu_count() or 1, 10)
-    if workers > 1:
-        with ProcessPoolExecutor(workers) as ex:
-            items = list(ex.map(_bench_worker, jobs, chunksize=2))
-    else:
-        items = list(map(_bench_worker, jobs))
+    items = _generate_results(_bench_worker, jobs, workers,
+                              f"generate bench profile={profile} workers={workers} out={out}", "samples")
     if profile == "simple_to_complex":
         used = set(exclude)
-        for j, item in enumerate(items):
-            if item["hash"] in used:
-                split, _, i = jobs[j][:3]
-                for attempt in range(item["attempts"] + 1, 240):
-                    candidate = sample_bench_item(split, seed, i, attempt, used, profile)
-                    if candidate:
-                        candidate["attempts"] = attempt
-                        item = candidate
-                        break
-                else:
-                    raise RuntimeError(f"no unique hard bench scene for {split} #{i}")
-                items[j] = item
-            used.add(item["hash"])
+        with GenerationProgress("deduplicate hard bench", len(items), "samples") as progress:
+            for j, item in enumerate(items):
+                if item["hash"] in used:
+                    split, _, i = jobs[j][:3]
+                    for attempt in range(item["attempts"] + 1, 240):
+                        candidate = sample_bench_item(split, seed, i, attempt, used, profile)
+                        if candidate:
+                            candidate["attempts"] = attempt
+                            item = candidate
+                            break
+                    else:
+                        raise RuntimeError(f"no unique hard bench scene for {split} #{i}")
+                    items[j] = item
+                used.add(item["hash"])
+                progress.advance()
     split_ids = [list(BENCH_SPLITS).index(j[0]) for j in jobs]
     skipped = {s: int(sum(it["attempts"] for it, j in zip(items, jobs) if j[0] == s)) for s in BENCH_SPLITS}
     pair = lambda key: np.stack([[r[key] for r in it["pair"]] for it in items])
-    np.savez_compressed(
-        out / "bench.npz",
-        ctx_fg=np.stack([it["fg"] for it in items]), ctx_bg=np.stack([it["bg"] for it in items]),
-        fut_fg=pair("fg"), fut_bg=pair("bg"),
-        labels=pair("label").astype(np.float32), settled_at=pair("settled_at").astype(np.int16),
-        n_changed=pair("n_changed").astype(np.int16), cascade=pair("cascade").astype(np.int16),
-        depth=pair("depth").astype(np.int16), violations=pair("violations").astype(np.int16),
-        rank_valid=np.array([it["rank_valid"] for it in items], dtype=bool),
-        split_ids=np.array(split_ids, dtype=np.int8))
+    with GenerationProgress("compress/write bench.npz"):
+        np.savez_compressed(
+            out / "bench.npz",
+            ctx_fg=np.stack([it["fg"] for it in items]), ctx_bg=np.stack([it["bg"] for it in items]),
+            fut_fg=pair("fg"), fut_bg=pair("bg"),
+            labels=pair("label").astype(np.float32), settled_at=pair("settled_at").astype(np.int16),
+            n_changed=pair("n_changed").astype(np.int16), cascade=pair("cascade").astype(np.int16),
+            depth=pair("depth").astype(np.int16), violations=pair("violations").astype(np.int16),
+            rank_valid=np.array([it["rank_valid"] for it in items], dtype=bool),
+            split_ids=np.array(split_ids, dtype=np.int8))
     meta = {
         "schema": SCHEMA, "grid": [DH, DW], "cell": CELL, "context_frames": CONTEXT, "horizon": HORIZON,
         "splits": list(BENCH_SPLITS),

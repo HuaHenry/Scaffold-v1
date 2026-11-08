@@ -23,8 +23,9 @@ $PY -m pytest -q -p no:cacheprovider exp/tests
 export FW_RUN=${FW_RUN:-$($PY -m exp.new_run ${LABEL:+--label "$LABEL"})}
 RUN_DIR=$($PY -m exp.new_run --path)
 echo "Experiment 07_03 simple-to-complex 81920: $RUN_DIR"
-$PY -m exp.generate_data --profile simple_to_complex --prefix-source "$PREFIX_SOURCE" \
-    --out "$DATA" --val "$VAL" --episodes "$EPISODES" --workers "$WORKERS" --val-extra 1024
+$PY -u -m exp.generate_data --profile simple_to_complex --prefix-source "$PREFIX_SOURCE" \
+    --out "$DATA" --val "$VAL" --episodes "$EPISODES" --workers "$WORKERS" --val-extra 1024 \
+    2>&1 | tee "$RUN_DIR/data_generation.log"
 BENCH=$($PY -c 'from exp.shared import common; import sys; print(common.resolve(common.load_json(common.resolve(sys.argv[1])/"curve_source.json")["bench"]))' "$DATA")
 $PY -m exp.audit --run "$FW_RUN" --data "$DATA" --val "$VAL" --bench "$BENCH" --epochs "$EPOCHS"
 $PY -m exp.make_jobs --run "$FW_RUN" --data "$DATA" --val "$VAL" --seeds "$SEEDS" --epochs "$EPOCHS"
