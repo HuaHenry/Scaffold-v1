@@ -6,16 +6,20 @@ import numpy as np
 import pytest
 import torch
 
-from exp.audit import audit
-from exp.analysis import load_scores, summarize
-from exp.generate_data import build, check_prefix, disjoint_scenes, prepare_validation
+from exp.audit import audit, check_scene_separation
+from exp.analysis import format_frames, load_scores, plot, plot_ticks, set_budget_axis, summarize
+from exp.generate_data import build, check_prefix, disjoint_scenes, frozen_hard_bench_disjoint, prepare_validation
+from datasets_v3 import state_hash
 from exp.make_jobs import epoch_steps, jobs
-from exp.shared import LEVELS, PACKAGE, common
+from exp.shared import EXP_NAME, LEVELS, PACKAGE, common
 
 
 def test_equal_budget_jobs():
     joblist = jobs("test-run", common.DEFAULT_DATA, (0,))
-    assert LEVELS[-1] == 4096 and len(joblist) == 34 and len({job["out"] for job in joblist}) == 34
+    expected = {"07_03_budget_epochs": 20480, "07_03_simple_to_complex": 40960,
+                "07_03_simple_to_complex_81920": 81920}.get(EXP_NAME, 4096)
+    assert LEVELS[-1] == expected and len(joblist) == len(LEVELS)*2
+    assert len({job["out"] for job in joblist}) == len(joblist)
     for job in joblist:
         cmd = job["cmd"]
         assert "--steps" in cmd and cmd[cmd.index("--steps") + 1] == "12000"
@@ -43,6 +47,42 @@ def test_full_epochs_train_every_transition_exactly_five_times():
         assert torch.equal(torch.bincount(torch.cat(seen), minlength=count), torch.full((count,), 5))
     assert epoch_steps(4096, "state", 256, 5) == 4480
     assert epoch_steps(4096, "process", 256, 5) == 4720
+    assert epoch_steps(20480, "state", 256, 5) == 22400
+    assert epoch_steps(20480, "process", 256, 5) == 23600
+    assert epoch_steps(40960, "state", 256, 5) == 44800
+    assert epoch_steps(40960, "process", 256, 5) == 47200
+    assert epoch_steps(81920, "state", 256, 5) == 89600
+    assert epoch_steps(81920, "process", 256, 5) == 94400
+
+
+def test_dense_budget_axis_labels_are_sparse_and_diagonal():
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    frames = [64*n for n in (16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
+                              1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 20480,
+                              28672, 32768, 40960, 49152, 57344, 65536, 73728, 81920)]
+    ticks = plot_ticks(frames, 7)
+    assert 2 <= len(ticks) <= 7 and ticks[0] == frames[0] and ticks[-1] == frames[-1]
+    assert all(t in frames for t in ticks)
+    assert format_frames(frames[-1]).endswith("M")
+    fig, ax = plt.subplots()
+    ax.set_xscale("log")
+    set_budget_axis(ax, frames, limit=7)
+    assert len(ax.get_xticks()) == len(ticks)
+    assert all(label.get_rotation() == 45 and label.get_ha() == "right" for label in ax.get_xticklabels())
+    plt.close(fig)
+
+
+def test_dense_budget_plots_render_with_rotated_ticks(tmp_path):
+    frames = [64 * n for n in (16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512,
+                                768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288,
+                                16384, 20480, 28672, 32768, 40960, 49152, 57344, 65536, 73728, 81920)]
+    rows = {str(f): {"total_frames_per_condition": f, "state": .2, "process": .3,
+                     "diff": .1, "diff_ci": [.05, .15]} for f in frames}
+    plot({split: {"levels": rows} for split in common.SPLITS}, tmp_path)
+    for name in ("budget_curve.png", "budget_curve.pdf", "budget_difference.png", "budget_difference.pdf"):
+        assert (tmp_path / name).stat().st_size > 1000
 
 
 def test_validation_is_at_each_epoch_boundary_and_legacy_schedule_is_unchanged():
@@ -56,7 +96,7 @@ def test_validation_is_at_each_epoch_boundary_and_legacy_schedule_is_unchanged()
 
 def test_full_epoch_jobs_keep_original_protocol_isolated():
     rows = jobs("test-run", common.DEFAULT_DATA, (0,), epochs=5)
-    assert len(rows) == 34
+    assert len(rows) == 2 * len(LEVELS)
     for j in rows:
         cmd = j["cmd"]
         condition, n = cmd[cmd.index("--condition")+1], int(cmd[cmd.index("--episodes")+1])
@@ -118,6 +158,8 @@ def test_crossing_requires_negative_and_positive_supported_endpoints():
 
 
 def test_existing_v3_prefix_and_bench_do_not_leak():
+    if EXP_NAME in ("07_03_simple_to_complex", "07_03_simple_to_complex_81920"):
+        pytest.skip("hard-transfer namespace requires its own benchmark")
     if not common.DEFAULT_BENCH.exists():
         pytest.skip("v3 data not present")
     expanded = common.GAME_CODE / "output/data_v3_curve_512"
@@ -179,6 +221,48 @@ def test_validation_collision_requires_another_directory(tmp_path):
         disjoint_scenes(data, val)
     common.dump_json([{"final_hash": "new"}], val / "train_scenes.json")
     assert disjoint_scenes(data, val) == ({"same", "other"}, {"new"})
+
+
+def test_frozen_hard_bench_only_reused_if_all_new_inputs_disjoint(tmp_path):
+    fg = np.zeros((2, 2), dtype=np.uint8)
+    bg = np.ones((2, 2), dtype=np.uint8)
+    scene = state_hash(fg, bg)
+    bench = tmp_path / "bench.npz"
+    np.savez_compressed(bench, ctx_fg=np.stack([fg]), ctx_bg=np.stack([bg]))
+    common.dump_json({"profile": "simple_to_complex"}, bench.with_suffix(".json"))
+    assert frozen_hard_bench_disjoint(bench, {"train"}, {"validation"}, "simple_to_complex")
+    assert not frozen_hard_bench_disjoint(bench, {scene}, set(), "simple_to_complex")
+    assert not frozen_hard_bench_disjoint(bench, set(), {scene}, "simple_to_complex")
+    with pytest.raises(ValueError, match="difficulty profile"):
+        frozen_hard_bench_disjoint(bench, set(), set(), "v3")
+    check_scene_separation({"a"}, {"b"}, {"c"}, include_validation_bench=True)
+    for t, v, b in (({"a"}, {"a"}, {"c"}), ({"a"}, {"b"}, {"a"}),
+                    ({"a"}, {"b"}, {"b"})):
+        with pytest.raises(ValueError, match="overlap"):
+            check_scene_separation(t, v, b, include_validation_bench=True)
+
+
+def test_extended_prefix_rejects_changed_condition(tmp_path):
+    original, extended = tmp_path / "original", tmp_path / "extended"
+    original.mkdir()
+    extended.mkdir()
+    common.dump_json([{"final_hash": "a"}, {"final_hash": "b"}], original / "train_scenes.json")
+    common.dump_json([{"final_hash": "a"}, {"final_hash": "b"}, {"final_hash": "c"}],
+                     extended / "train_scenes.json")
+    for cond in common.CONDITIONS:
+        for directory, n in ((original, 2), (extended, 3)):
+            values = np.zeros((n, 2, 2), dtype=np.uint8)
+            np.savez_compressed(directory / f"train_{cond}.npz",
+                                **{key: values for key in ("fg", "bg", "cont", "phase")})
+            common.dump_json({"actions": [[] for _ in range(n)], "extra": [{} for _ in range(n)]},
+                             directory / f"train_{cond}_actions.json")
+    assert check_prefix(original, extended) == 2
+    with np.load(extended / "train_process.npz") as z:
+        arrays = {key: z[key].copy() for key in z.files}
+    arrays["fg"][0, 0, 0] = 1
+    np.savez_compressed(extended / "train_process.npz", **arrays)
+    with pytest.raises(ValueError, match="regenerated prefix"):
+        check_prefix(original, extended)
 
 
 def test_curve_resume_rejects_missing_checkpoint(tmp_path):

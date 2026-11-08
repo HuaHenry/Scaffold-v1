@@ -11,10 +11,7 @@ game_code/.playwright-cli/
 experiments/
 
 # generated data: regenerate with `python run.py --data-v3`
-# (comment these out if you want to ship the data in the repo)
-game_code/output/data/
-game_code/output/data_v3/
-game_code/output/data_val_v3/
+game_code/output/
 
 # job lists are generated
 preresearch/*/exp/jobs/

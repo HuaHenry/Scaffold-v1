@@ -225,6 +225,31 @@ def markdown(by_split, auxiliary, sources, config, budgets=None):
     return "\n".join(lines)
 
 
+def plot_ticks(frames, limit=8):
+    """Keep actual log-spaced budget positions, displaying only readable major ticks."""
+    if len(frames) <= limit:
+        return frames
+    targets = np.geomspace(frames[0], frames[-1], limit)
+    ticks = sorted({min(frames, key=lambda value: abs(math.log(value / target))) for target in targets})
+    return sorted(set(ticks) | {frames[0], frames[-1]})
+
+
+def format_frames(value):
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.3g}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.3g}k"
+    return str(value)
+
+
+def set_budget_axis(ax, frames, limit=8):
+    ticks = plot_ticks(frames, limit)
+    ax.set_xticks(ticks, [format_frames(v) for v in ticks])
+    ax.tick_params(axis="x", labelrotation=45, labelsize=8)
+    for label in ax.get_xticklabels():
+        label.set_horizontalalignment("right")
+
+
 def plot(by_split, out):
     import matplotlib
     matplotlib.use("Agg")
@@ -237,7 +262,7 @@ def plot(by_split, out):
         for c, color in (("state", "#3d639e"), ("process", "#c66d56")):
             ax.plot(x, [r[c] for r in rows], "o-", color=color, label=c)
         ax.set(xscale="log", title=sp, xlabel="Training frames per condition", ylabel="Cascade F1", ylim=(0, 1))
-        ax.set_xticks(x, [str(v) for v in x])
+        set_budget_axis(ax, x, limit=7)
         ax.grid(alpha=.2)
     axes.flat[0].legend(frameon=False)
     fig.savefig(out / "budget_curve.pdf")
@@ -251,7 +276,7 @@ def plot(by_split, out):
     ax.errorbar(x, y, yerr=error, fmt="o-", color="#3d639e", capsize=4)
     ax.axhline(0, color="#c66d56", lw=1)
     ax.set(xscale="log", xlabel="Training frames per condition", ylabel="Process − state cascade F1 (id)")
-    ax.set_xticks(x, [str(v) for v in x])
+    set_budget_axis(ax, x, limit=10)
     ax.grid(alpha=.2)
     fig.savefig(out / "budget_difference.pdf")
     fig.savefig(out / "budget_difference.png", dpi=240)
@@ -295,7 +320,20 @@ def main(argv=None):
     common.write_meta(out, "analysis", "budget_curve", {"steps": a.steps, "epochs": a.epochs, "seeds": seeds, "boot": a.boot}, inputs=inputs)
     common.dump_json({"by_split": result, "budgets": budgets, "auxiliary": auxiliary,
                       "training": config, "inputs": inputs}, out / "budget_curve.json")
-    (out / "budget_curve.md").write_text(markdown(result, auxiliary, sources, config, budgets), encoding="utf-8")
+    report = markdown(result, auxiliary, sources, config, budgets)
+    if EXP_NAME == "07_03_simple_to_complex_81920":
+        benchmark_origin = common.load_json(data / "curve_source.json")["bench_origin"]
+        report = ("# 07_03: simple training to hard evaluation\n\n"
+                  "The 'id' label denotes hard transfer, NOT in-distribution. "
+                  f"Benchmark: {benchmark_origin}. "
+                  "Only compare previous results directly if the benchmark hashes match.\n\n"
+                  + report)
+    elif EXP_NAME == "07_03_simple_to_complex":
+        report = ("# 07_03: simple training to hard evaluation\n\n"
+                  "New independent data and harder bench: the 'id' label denotes hard transfer, NOT in-distribution; "
+                  "do not splice results from earlier benchmarks.\n\n"
+                  + report)
+    (out / "budget_curve.md").write_text(report, encoding="utf-8")
     plot(result, out)
     print(common.rel(out))
     print("id:", result["id"]["conclusion"], "crossings:", result["id"]["crossings"])

@@ -266,12 +266,15 @@ def sample_scene(rng, kinds, scale, gap=(2, 4), mirror_p=.5, max_actions=None):
             "n_actions": n, "actions": [a for p in per for a, _ in p]}
 
 
-def sample_split_kinds(rng, split):
+def sample_split_kinds(rng, split, profile="v3"):
     cfg = BENCH_SPLITS[split]
+    if profile == "simple_to_complex" and split == "id":
+        n = rng.choices([2, 3], weights=[.6, .4])[0]
+        return pick_kinds(rng, n, KINDS)
     if split == "combo_ood":
         a, b = rng.choice(HELD_PAIRS)
         ks = [a, b] if rng.random() < .5 else [b, a]
-        if rng.random() < .5:
+        if profile == "simple_to_complex" or rng.random() < .5:
             rest = [k for k in KINDS if k not in ks]
             ks.insert(rng.randint(0, 2), rng.choice(rest))
         return ks
@@ -548,7 +551,18 @@ GEN = {"single": gen_single, "multi": gen_multi, "seq2": gen_seq2, "place_remove
 TRAIN_W = {"single": .30, "multi": .18, "seq2": .14, "place_remove": .10, "door": .08, "back": .08, "drop": .12}
 
 
-def pick_training_intervention(fg, bg, rng, wseed=0):
+def pick_training_intervention(fg, bg, rng, wseed=0, profile="v3"):
+    if profile == "simple_to_complex":
+        pool = struct_pool(fg)
+        if pool:
+            choices = [cell for cell in pool if 1 <= static_cascade(fg, [cell]) <= 6]
+            if not choices:
+                choices = [cell for cell in pool if static_cascade(fg, [cell]) <= 6]
+            x, y = rng.choice(choices or pool)
+            return mk("single", (0, [_a("remove", x, y)]))
+        return mk("noop", (0, [_a("noop", 0, 0)]))
+    if profile != "v3":
+        raise ValueError(f"unknown training profile: {profile}")
     kinds, ws = list(TRAIN_W), list(TRAIN_W.values())
     for _ in range(8):
         iv = GEN[rng.choices(kinds, weights=ws)[0]](fg, bg, rng, wseed)
@@ -572,14 +586,24 @@ def op_clip(fg, bg, iv, seed, length=CLIP):
 
 
 # ----------------------------------------------------------------------------- training episodes
-def sample_train_scene(rng, max_actions):
-    n = rng.choices([1, 2, 3], weights=[.30, .45, .25])[0]
-    ks = pick_kinds(rng, n, KINDS)
+def sample_train_scene(rng, max_actions, profile="v3"):
+    if profile == "simple_to_complex":
+        n = rng.choices([1, 2], weights=[.35, .65])[0]
+        kinds = D.TRAIN_KINDS
+    elif profile == "v3":
+        n = rng.choices([1, 2, 3], weights=[.30, .45, .25])[0]
+        kinds = KINDS
+    else:
+        raise ValueError(f"unknown training profile: {profile}")
+    ks = pick_kinds(rng, n, kinds)
     return sample_scene(rng, ks, "base", (2, 4), max_actions=max_actions) if ks else None
 
 
 def make_episode_set(seed: int, index: int, T: int = T_DEFAULT, F: int = F_FORM, n_clips: int | None = None,
-                     n_state_clips: int | None = None, p_mistake: float = DEFAULT_P, scaffold: bool = True) -> dict:
+                     n_state_clips: int | None = None, p_mistake: float = DEFAULT_P, scaffold: bool = True,
+                     profile: str = "v3") -> dict:
+    if profile not in ("v3", "simple_to_complex"):
+        raise ValueError(f"unknown training profile: {profile}")
     n_clips = (T - F) // CLIP if n_clips is None else n_clips
     n_state = T // CLIP if n_state_clips is None else n_state_clips
     assert F + n_clips * CLIP == T and n_state * CLIP == T, "frame budgets must match across conditions"
@@ -589,7 +613,7 @@ def make_episode_set(seed: int, index: int, T: int = T_DEFAULT, F: int = F_FORM,
     for attempt in range(60):
         rng = rng_for(seed, "scene", index, attempt)
         p = p_mistake if attempt < 30 else 0.0
-        scene = sample_train_scene(rng, cap)
+        scene = sample_train_scene(rng, cap, profile) if profile != "v3" else sample_train_scene(rng, cap)
         if scene is None:
             continue
         script = build_script(scene, rng, S, p, scaffold and attempt < 45)
@@ -607,7 +631,7 @@ def make_episode_set(seed: int, index: int, T: int = T_DEFAULT, F: int = F_FORM,
         raise RuntimeError(f"no valid training scene for seed={seed} index={index}")
 
     erng = rng_for(seed, "events", index)
-    events = [pick_training_intervention(final_fg, final_bg, erng, int_seed(seed, "evw", index, j))
+    events = [pick_training_intervention(final_fg, final_bg, erng, int_seed(seed, "evw", index, j), profile)
               for j in range(n_state)]
 
     def clips(base_fg, base_bg, evs, tag):
@@ -635,7 +659,7 @@ def make_episode_set(seed: int, index: int, T: int = T_DEFAULT, F: int = F_FORM,
     p_frames, p_kinds = [], []
     for j, k in enumerate(picks):
         bfg, bbg = D.settle_copy(form[k][0], form[k][1], int_seed(seed, "pbase", index, j))
-        iv = pick_training_intervention(bfg, bbg, qrng, int_seed(seed, "pw", index, j))
+        iv = pick_training_intervention(bfg, bbg, qrng, int_seed(seed, "pw", index, j), profile)
         p_kinds.append(iv["kind"])
         p_frames += op_clip(bfg, bbg, iv, int_seed(seed, "partial", index, j))
     episodes["partial"] = D.pack(p_frames, [1] * len(p_frames))
@@ -660,8 +684,11 @@ def generate_train(out: Path, episodes: int, T: int, seed: int, workers: int = 0
     F = kw.get("F", F_FORM)
     n_clips = (T - F) // CLIP if kw.get("n_clips") is None else kw["n_clips"]
     n_state = T // CLIP if kw.get("n_state_clips") is None else kw["n_state_clips"]
+    profile = kw.get("profile", "v3")
+    if profile not in ("v3", "simple_to_complex"):
+        raise ValueError(f"unknown training profile: {profile}")
     jobs = [(seed, i, T, F, kw.get("n_clips"), kw.get("n_state_clips"), kw.get("p_mistake", DEFAULT_P),
-             kw.get("scaffold", True)) for i in range(episodes)]
+             kw.get("scaffold", True)) + ((profile,) if profile != "v3" else ()) for i in range(episodes)]
     workers = workers or min(os.cpu_count() or 1, 10)
     if workers > 1:
         with ProcessPoolExecutor(workers) as ex:
@@ -697,6 +724,8 @@ def generate_train(out: Path, episodes: int, T: int, seed: int, workers: int = 0
                    "layout": {"formation": F, "clip": CLIP, "state_clips": n_state, "mixed_clips": n_clips},
                    "builder": {"p_mistake": kw.get("p_mistake", DEFAULT_P), "scaffold": kw.get("scaffold", True)},
                    "conditions": summary}
+    if profile != "v3":
+        summary_all["profile"] = profile
     (out / "train_summary.json").write_text(json.dumps(summary_all, indent=2), encoding="utf-8")
     return summary_all
 
@@ -754,10 +783,12 @@ def randomized_pair_order(pair, rng):
     return pair[::-1] if rng.getrandbits(1) else pair
 
 
-def sample_bench_item(split, seed, i, attempt, exclude):
+def sample_bench_item(split, seed, i, attempt, exclude, profile="v3"):
+    if profile not in ("v3", "simple_to_complex"):
+        raise ValueError(f"unknown bench profile: {profile}")
     rng = rng_for(seed, "bench", split, i, attempt)
     cfg = BENCH_SPLITS[split]
-    kinds = sample_split_kinds(rng, split)
+    kinds = sample_split_kinds(rng, split, profile)
     if not kinds:
         return None
     scene = sample_scene(rng, kinds, cfg["scale"], cfg["gap"], max_actions=330)
@@ -797,6 +828,11 @@ def sample_bench_item(split, seed, i, attempt, exclude):
     if not pairs:
         return None
     gap = lambda p: runs[p[0]]["label"] - runs[p[1]]["label"]
+    if profile == "simple_to_complex":
+        pairs = [p for p in pairs if runs[p[0]]["cascade"] >= 6 and runs[p[0]]["depth"] >= 3
+                 and runs[p[1]]["cascade"] >= 2 and gap(p) >= RANK_MARGIN]
+        if not pairs:
+            return None
     same = [p for p in pairs if runs[p[0]]["n_actions"] == runs[p[1]]["n_actions"] and gap(p) >= RANK_MARGIN]
     valid = [p for p in pairs if gap(p) >= RANK_MARGIN]
     pool = same or valid or pairs
@@ -807,25 +843,45 @@ def sample_bench_item(split, seed, i, attempt, exclude):
 
 
 def _bench_worker(args):
-    split, seed, i, exclude = args
-    for attempt in range(80):
-        item = sample_bench_item(split, seed, i, attempt, exclude)
+    split, seed, i, exclude, *options = args
+    profile = options[0] if options else "v3"
+    for attempt in range(240 if profile == "simple_to_complex" else 80):
+        item = sample_bench_item(split, seed, i, attempt, exclude, profile)
         if item:
             item["attempts"] = attempt
             return item
     raise RuntimeError(f"could not sample {split} #{i}")
 
 
-def generate_bench(out: Path, per_split: int, seed: int, exclude=None, workers: int = 0) -> dict:
+def generate_bench(out: Path, per_split: int, seed: int, exclude=None, workers: int = 0,
+                   profile: str = "v3") -> dict:
+    if profile not in ("v3", "simple_to_complex"):
+        raise ValueError(f"unknown bench profile: {profile}")
     out.mkdir(parents=True, exist_ok=True)
     exclude = set(exclude or ())
-    jobs = [(split, seed, i, exclude) for split in BENCH_SPLITS for i in range(per_split)]
+    jobs = [(split, seed, i, exclude) + ((profile,) if profile != "v3" else ())
+            for split in BENCH_SPLITS for i in range(per_split)]
     workers = workers or min(os.cpu_count() or 1, 10)
     if workers > 1:
         with ProcessPoolExecutor(workers) as ex:
             items = list(ex.map(_bench_worker, jobs, chunksize=2))
     else:
         items = list(map(_bench_worker, jobs))
+    if profile == "simple_to_complex":
+        used = set(exclude)
+        for j, item in enumerate(items):
+            if item["hash"] in used:
+                split, _, i = jobs[j][:3]
+                for attempt in range(item["attempts"] + 1, 240):
+                    candidate = sample_bench_item(split, seed, i, attempt, used, profile)
+                    if candidate:
+                        candidate["attempts"] = attempt
+                        item = candidate
+                        break
+                else:
+                    raise RuntimeError(f"no unique hard bench scene for {split} #{i}")
+                items[j] = item
+            used.add(item["hash"])
     split_ids = [list(BENCH_SPLITS).index(j[0]) for j in jobs]
     skipped = {s: int(sum(it["attempts"] for it, j in zip(items, jobs) if j[0] == s)) for s in BENCH_SPLITS}
     pair = lambda key: np.stack([[r[key] for r in it["pair"]] for it in items])
@@ -858,6 +914,12 @@ def generate_bench(out: Path, per_split: int, seed: int, exclude=None, workers: 
                                 "x0s": it["scene"]["x0s"], "mirrored": it["scene"]["mirrored"]} for it in items]),
         "interventions": [[r["iv"] for r in it["pair"]] for it in items],
         "split_of_sample": [list(BENCH_SPLITS)[s] for s in split_ids], "rejected_attempts": skipped}
+    if profile != "v3":
+        meta["profile"] = profile
+        meta["split_definitions"]["id"] = "hard transfer: 2-3 structures from all 16 kinds; not in-distribution"
+        meta["split_definitions"]["combo_ood"] = "held-out pair plus a third structure"
+        meta["hard_requirements"] = {"main_cascade": 6, "main_depth": 3,
+                                     "other_cascade": 2, "rank_margin": RANK_MARGIN}
     (out / "bench.json").write_text(json.dumps(D._jsonable(meta), indent=1), encoding="utf-8")
     return {"samples": len(items), "rejected_attempts": skipped}
 

@@ -324,6 +324,23 @@ class DatasetV3Tests(unittest.TestCase):
             np.testing.assert_array_equal(ep['fg'], b['episodes'][c]['fg'])
         self.assertTrue(a['meta']['formation_settled'])
 
+    def test_simple_training_and_hard_evaluation_profile(self):
+        import datasets as base
+        import datasets_v3 as v3
+        easy = v3.make_episode_set(0, 0, p_mistake=0, scaffold=False, profile='simple_to_complex')
+        self.assertLessEqual(easy['meta']['n_struct'], 2)
+        self.assertTrue(set(easy['meta']['kinds']).issubset(base.TRAIN_KINDS))
+        self.assertEqual(set(easy['meta']['event_kinds']), {'single'})
+        for c in ('state', 'process'):
+            self.assertEqual(easy['episodes'][c]['fg'].shape[0], 64)
+        for split in v3.BENCH_SPLITS:
+            item = v3._bench_worker((split, 2027, 0, set(), 'simple_to_complex'))
+            cascades = sorted((r['cascade'] for r in item['pair']))
+            self.assertGreaterEqual(cascades[0], 2)
+            self.assertGreaterEqual(cascades[1], 6)
+            self.assertTrue(item['rank_valid'])
+            self.assertGreaterEqual(max(r['depth'] for r in item['pair']), 3)
+
     def test_v3_bench_item_is_hard_and_valid(self):
         import datasets_v3 as v3
         item = None
