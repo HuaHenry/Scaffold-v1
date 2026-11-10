@@ -242,12 +242,26 @@ def format_frames(value):
     return str(value)
 
 
-def set_budget_axis(ax, frames, limit=8):
-    ticks = plot_ticks(frames, limit)
-    ax.set_xticks(ticks, [format_frames(v) for v in ticks])
+def set_budget_axis(ax, frames, limit=8, equal_spacing=False):
+    if equal_spacing:
+        indices = np.unique(np.linspace(0, len(frames) - 1, min(len(frames), limit), dtype=int))
+        ax.set_xticks(indices, [format_frames(frames[i]) for i in indices])
+    else:
+        ticks = plot_ticks(frames, limit)
+        ax.set_xticks(ticks, [format_frames(v) for v in ticks])
     ax.tick_params(axis="x", labelrotation=45, labelsize=8)
     for label in ax.get_xticklabels():
         label.set_horizontalalignment("right")
+
+
+def smooth_curve(x, y):
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    if len(x) < 2:
+        return x, y
+    dense_x = np.linspace(x[0], x[-1], max(200, len(x) * 12))
+    weights = np.exp(-0.5 * ((dense_x[:, None] - x[None, :]) / 0.65) ** 2)
+    weights /= weights.sum(axis=1, keepdims=True)
+    return dense_x, weights @ y
 
 
 def plot(by_split, out):
@@ -255,28 +269,47 @@ def plot(by_split, out):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    uncertainty = ("paired seeds and scenes" if all(r.get("n_seeds", 1) > 1 for r in by_split.values())
+                   else "scenes only; one training seed")
+    note = ("Line: mild Gaussian smoothing (sigma=0.65 budget steps); dots: raw means\n"
+            f"Shading: pointwise 95% bootstrap CI of raw means ({uncertainty})")
     fig, axes = plt.subplots(2, 2, figsize=(10, 7), constrained_layout=True)
+    fig.suptitle(note, fontsize=9)
     for ax, (sp, result) in zip(axes.flat, by_split.items()):
-        rows = list(result["levels"].values())
-        x = [r["total_frames_per_condition"] for r in rows]
+        rows = sorted(result["levels"].values(), key=lambda r: r["total_frames_per_condition"])
+        frames = [r["total_frames_per_condition"] for r in rows]
+        x = np.arange(len(rows))
         for c, color in (("state", "#3d639e"), ("process", "#c66d56")):
-            ax.plot(x, [r[c] for r in rows], "o-", color=color, label=c)
-        ax.set(xscale="log", title=sp, xlabel="Training frames per condition", ylabel="Cascade F1", ylim=(0, 1))
-        set_budget_axis(ax, x, limit=7)
+            y = [r[c] for r in rows]
+            bounds = np.asarray([r[f"{c}_ci"] for r in rows])
+            ax.plot(x, y, "o", color=color, markersize=3, alpha=.55)
+            smooth_x, smooth_y = smooth_curve(x, y)
+            ax.plot(smooth_x, smooth_y, color=color, label=c, linewidth=2)
+            ax.fill_between(x, bounds[:, 0], bounds[:, 1], color=color, alpha=.16, linewidth=0)
+        ax.set(title=sp, xlabel="Training frames per condition (equally spaced; not to scale)",
+               ylabel="Cascade F1", ylim=(0, 0.5))
+        set_budget_axis(ax, frames, limit=7, equal_spacing=True)
         ax.grid(alpha=.2)
     axes.flat[0].legend(frameon=False)
     fig.savefig(out / "budget_curve.pdf")
     fig.savefig(out / "budget_curve.png", dpi=240)
     plt.close(fig)
     fig, ax = plt.subplots(figsize=(8, 4.2), constrained_layout=True)
-    rows = list(by_split["id"]["levels"].values())
-    x = [r["total_frames_per_condition"] for r in rows]
+    fig.suptitle(note, fontsize=8)
+    rows = sorted(by_split["id"]["levels"].values(), key=lambda r: r["total_frames_per_condition"])
+    frames = [r["total_frames_per_condition"] for r in rows]
+    x = np.arange(len(rows))
     y = [r["diff"] for r in rows]
-    error = [[r["diff"]-r["diff_ci"][0] for r in rows], [r["diff_ci"][1]-r["diff"] for r in rows]]
-    ax.errorbar(x, y, yerr=error, fmt="o-", color="#3d639e", capsize=4)
+    bounds = np.asarray([r["diff_ci"] for r in rows])
+    ax.plot(x, y, "o", color="#3d639e", markersize=3, alpha=.55)
+    smooth_x, smooth_y = smooth_curve(x, y)
+    ax.plot(smooth_x, smooth_y, color="#3d639e", linewidth=2)
+    ax.fill_between(x, bounds[:, 0], bounds[:, 1], color="#3d639e", alpha=.16, linewidth=0)
     ax.axhline(0, color="#c66d56", lw=1)
-    ax.set(xscale="log", xlabel="Training frames per condition", ylabel="Process − state cascade F1 (id)")
-    set_budget_axis(ax, x, limit=10)
+    ax.set(xlabel="Training frames per condition (equally spaced; not to scale)",
+           ylabel="Process − state cascade F1 (id)")
+    ax.set_ylim(top=0.5)
+    set_budget_axis(ax, frames, limit=10, equal_spacing=True)
     ax.grid(alpha=.2)
     fig.savefig(out / "budget_difference.pdf")
     fig.savefig(out / "budget_difference.png", dpi=240)
@@ -321,7 +354,7 @@ def main(argv=None):
     common.dump_json({"by_split": result, "budgets": budgets, "auxiliary": auxiliary,
                       "training": config, "inputs": inputs}, out / "budget_curve.json")
     report = markdown(result, auxiliary, sources, config, budgets)
-    if EXP_NAME == "07_03_simple_to_complex_81920":
+    if EXP_NAME in ("07_03_simple_to_complex_81920", "07_03_simple_to_complex_163840"):
         benchmark_origin = common.load_json(data / "curve_source.json")["bench_origin"]
         report = ("# 07_03: simple training to hard evaluation\n\n"
                   "The 'id' label denotes hard transfer, NOT in-distribution. "

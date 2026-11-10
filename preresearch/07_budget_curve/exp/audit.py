@@ -16,7 +16,36 @@ def check_scene_separation(training, validation, benchmark, include_validation_b
         raise ValueError("validation scenes overlap the hard benchmark")
 
 
+def frozen_inputs(data, episodes=163840):
+    data = common.resolve(data)
+    source = common.load_json(data / "curve_source.json")
+    summary = common.load_summary(data)
+    if (source.get("data") != common.rel(data) or source.get("episodes") != episodes
+            or source.get("profile") != "simple_to_complex"
+            or source.get("prefix_identical_episodes") != 0
+            or source.get("extended_prefix_identical_episodes") != 81920
+            or source.get("prefix_source") != common.rel(common.GAME_CODE / "output/data_v3_simple_train_hard_eval_81920")
+            or summary.get("seed") != 0 or summary.get("profile") != "simple_to_complex"
+            or summary.get("layout") != {"formation": 32, "clip": 8, "state_clips": 8, "mixed_clips": 4}
+            or summary.get("builder") != {"p_mistake": 0.0, "scaffold": False}
+            or any(summary["conditions"][c]["episodes"] != episodes for c in common.CONDITIONS)):
+        raise ValueError("completed simple training data differs from the required frozen budget")
+    val, bench = common.resolve(source["val"]), common.resolve(source["bench"])
+    names = ["train_summary.json", "train_scenes.json", "train_finals.npz"]
+    names += [f"train_{c}{suffix}" for c in common.CONDITIONS for suffix in (".npz", "_actions.json")]
+    required = [directory / name for directory in (data, val) for name in names]
+    required += [bench, bench.with_suffix(".json")]
+    for path in required:
+        if not path.is_file() or not path.stat().st_size:
+            raise FileNotFoundError(f"frozen input missing: {path}; refusing to generate any data")
+    return val, bench
+
+
 def audit(data, val, bench, levels=LEVELS):
+    if EXP_NAME == "07_03_simple_to_complex_163840":
+        frozen_val, frozen_bench = frozen_inputs(data)
+        if common.resolve(val) != frozen_val or common.resolve(bench) != frozen_bench:
+            raise ValueError("full curve must reuse its completed frozen validation and bench")
     summary = common.load_summary(data)
     largest = max(levels)
     if summary["seed"] != 0 or summary["layout"] != {"formation": 32, "clip": 8, "state_clips": 8, "mixed_clips": 4}:
@@ -30,7 +59,7 @@ def audit(data, val, bench, levels=LEVELS):
             raise ValueError("dataset does not match its provenance")
         if source["val"] != common.rel(val) or source["bench"] != common.rel(bench):
             raise ValueError("validation or bench differs from expanded dataset provenance")
-        if EXP_NAME in ("07_03_simple_to_complex", "07_03_simple_to_complex_81920"):
+        if EXP_NAME in ("07_03_simple_to_complex", "07_03_simple_to_complex_81920", "07_03_simple_to_complex_163840"):
             if (source.get("profile") != "simple_to_complex" or source["prefix_identical_episodes"] != 0
                     or summary.get("profile") != "simple_to_complex"
                     or summary.get("builder") != {"p_mistake": 0.0, "scaffold": False}):
@@ -60,8 +89,8 @@ def audit(data, val, bench, levels=LEVELS):
         bench_hashes = {state_hash(fg, bg) for fg, bg in zip(b["ctx_fg"], b["ctx_bg"])}
         n_bench = len(b["ctx_fg"])
     check_scene_separation(set(hashes), val_scenes, bench_hashes,
-                           include_validation_bench=EXP_NAME == "07_03_simple_to_complex_81920")
-    if EXP_NAME in ("07_03_simple_to_complex", "07_03_simple_to_complex_81920"):
+                           include_validation_bench=EXP_NAME in ("07_03_simple_to_complex_81920", "07_03_simple_to_complex_163840"))
+    if EXP_NAME in ("07_03_simple_to_complex", "07_03_simple_to_complex_81920", "07_03_simple_to_complex_163840"):
         import datasets as base
         bm = common.load_json(Path(bench).with_suffix(".json"))
         with np.load(bench) as b:
@@ -119,7 +148,7 @@ def main(argv=None):
     if a.epochs is not None and a.epochs <= 0:
         ap.error("--epochs must be positive")
     if EXP_NAME in ("07_02_budget_epochs", "07_03_budget_epochs", "07_03_simple_to_complex",
-                    "07_03_simple_to_complex_81920") and a.epochs is None:
+                    "07_03_simple_to_complex_81920", "07_03_simple_to_complex_163840") and a.epochs is None:
         ap.error("full-epoch budget curves require --epochs")
     r = a.run or common.current_run(EXP_NAME)
     data = common.resolve(a.data)
@@ -129,7 +158,8 @@ def main(argv=None):
     result = audit(data, val, bench)
     if a.epochs is not None:
         result["training_protocol"] = {"mode": "full_epochs", "epochs": a.epochs, "batch": 256}
-        if EXP_NAME in ("07_03_budget_epochs", "07_03_simple_to_complex", "07_03_simple_to_complex_81920"):
+        if EXP_NAME in ("07_03_budget_epochs", "07_03_simple_to_complex", "07_03_simple_to_complex_81920",
+                        "07_03_simple_to_complex_163840"):
             for level in result["levels"].values():
                 level["conditions"]["process"]["batch_formation_fraction"] = 31 / 59
     target = common.RESULTS_ROOT / EXP_NAME / r / "audit.json"

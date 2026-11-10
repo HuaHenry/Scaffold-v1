@@ -38,6 +38,11 @@ def jobs(run, data, seeds, steps=12000, batch=256, lr=3e-4, change_weight=8, dep
     return result
 
 
+def check_audited_levels(audited):
+    if tuple(sorted(map(int, audited["levels"]))) != LEVELS:
+        raise ValueError("existing run has different budget levels; use a new run for the full curve")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run", default=None)
@@ -65,6 +70,7 @@ def main(argv=None):
     if not (d / "audit.json").is_file():
         raise FileNotFoundError("run exp.audit first; it verifies equal frames and evaluation deduplication")
     audited = common.load_json(d / "audit.json")
+    check_audited_levels(audited)
     protocol = audited.get("training_protocol", {})
     if (a.epochs is None and protocol or a.epochs is not None
             and protocol != {"mode": "full_epochs", "epochs": a.epochs, "batch": a.batch}):

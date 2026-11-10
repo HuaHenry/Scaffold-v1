@@ -79,7 +79,9 @@ def frozen_hard_bench_disjoint(path, train, validation, profile):
 
 
 def build(source, out, val, episodes=4096, workers=0, prefix_source=None, val_extra=64,
-          profile="v3"):
+          profile="v3", reuse_train=False):
+    if reuse_train and not (Path(out) / "train_summary.json").is_file():
+        raise FileNotFoundError("--reuse-train requires a complete training dataset; refusing to regenerate it")
     if profile not in ("v3", "simple_to_complex"):
         raise ValueError(f"unknown data profile: {profile}")
     source, out, val = map(Path, (source, out, val))
@@ -89,10 +91,14 @@ def build(source, out, val, episodes=4096, workers=0, prefix_source=None, val_ex
     if prefix_source is not None and prefix_source.resolve() == out.resolve():
         raise ValueError("prefix source must not be the output directory")
     if profile == "simple_to_complex" and prefix_source is not None:
+        prefix_episodes = 81920 if episodes == 163840 else 40960
         frozen = common.load_json(prefix_source / "curve_source.json")
-        if (frozen.get("profile") != profile or frozen.get("episodes") != 40960
+        if (frozen.get("profile") != profile or frozen.get("episodes") != prefix_episodes
                 or frozen.get("data_sha1") != input_hashes(prefix_source)):
-            raise ValueError("40960-episode prefix no longer matches its frozen provenance")
+            raise ValueError(f"{prefix_episodes}-episode prefix no longer matches its frozen provenance")
+        if (episodes == 163840 and val.resolve() == common.resolve(frozen["val"]).resolve()
+                and frozen.get("val_sha1") != input_hashes(val)):
+            raise ValueError("163840 expansion requires the unchanged frozen validation dataset when reusing it")
     if source.resolve() == out.resolve():
         raise ValueError("source and output must be different folders")
     old = common.load_summary(source)
@@ -140,12 +146,15 @@ def build(source, out, val, episodes=4096, workers=0, prefix_source=None, val_ex
         if earlier_bench and (frozen.get("bench") != common.rel(earlier_bench)
                               or frozen.get("bench_sha1") != {p.name: common.sha1_file(p)
                                     for p in (earlier_bench, earlier_bench.with_suffix(".json"))}):
-            raise ValueError("40960-episode prefix benchmark differs from its frozen provenance")
+            raise ValueError(f"{prefix_episodes}-episode prefix benchmark differs from its frozen provenance")
         if earlier_bench and frozen_hard_bench_disjoint(earlier_bench, train, validation, profile):
             bench = earlier_bench
             bench_origin = "frozen previous hard bench: still disjoint from the full training/validation data"
         else:
             bench = out / "bench.npz"
+            if earlier_bench:
+                print("[data] previous bench overlaps expanded training/validation; "
+                      "using a separate hard bench without changing training data or the previous bench", flush=True)
             if not bench.is_file():
                 generate_bench(out, 128, 2027, train | validation, workers, profile=profile)
             if common.load_json(bench.with_suffix(".json")).get("profile") != profile:
@@ -195,11 +204,14 @@ def main(argv=None):
     ap.add_argument("--val-extra", type=int, default=64,
                     help="additional candidate validation scenes to filter against the full training dataset")
     ap.add_argument("--profile", choices=("v3", "simple_to_complex"), default="v3")
+    ap.add_argument("--reuse-train", action="store_true",
+                    help="reuse completed training data only; never fall back to regenerating it")
     a = ap.parse_args(argv)
     out = common.resolve(a.out)
     result = build(common.resolve(a.source), out, common.resolve(a.val) if a.val else out / "validation",
                    a.episodes, a.workers,
-                   common.resolve(a.prefix_source) if a.prefix_source else None, a.val_extra, a.profile)
+                   common.resolve(a.prefix_source) if a.prefix_source else None, a.val_extra, a.profile,
+                   reuse_train=a.reuse_train)
     print("data:", result["data"], "val:", result["val"], "bench:", result["bench"], result["bench_origin"])
 
 
