@@ -8,7 +8,7 @@ from .shared import EXP_NAME, common, run_path
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--label", default="formation_ratio")
+    ap.add_argument("--label", default="supervision_ratio")
     ap.add_argument("--path", action="store_true", help="print FW_RUN path without creating it")
     a = ap.parse_args(argv)
     name = os.environ.get("FW_RUN")

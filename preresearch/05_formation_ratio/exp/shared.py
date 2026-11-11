@@ -1,8 +1,8 @@
-"""Formation-dose protocol and source identity checks, independent of older experiments."""
+"""Version 2: equal-update supervision mixtures on unchanged frozen trajectories."""
 from contextlib import contextmanager
 import fcntl
+import hashlib
 from importlib import import_module
-import math
 import os
 from pathlib import Path
 import sys
@@ -16,31 +16,48 @@ PACKAGE = "preresearch.01_pilot_validity.exp"
 MAIN_PACKAGE = "preresearch.03_main.exp"
 common = import_module(f"{PACKAGE}.common")
 metrics = import_module(f"{PACKAGE}.metrics")
-main_shared = import_module(f"{MAIN_PACKAGE}.shared")
 helpers = import_module("preresearch.04_ood_generalization.exp.shared")
 write_json, write_npz, resolve_file = helpers.write_json, helpers.write_npz, helpers.resolve_file
-EXP_NAME = "05_formation_ratio"
-VERSION = 1
-LEVELS = (0, 8, 16, 32, 48)
-EPISODES, EPOCHS, BATCH = 81920, 5, 256
+EXP_NAME, VERSION = "05_formation_ratio", 2
+MODE = "supervision_sampling"
+RATIOS = (0.0, 0.125, 0.25, 0.5, 0.75)
+EPISODES, BATCH, STEPS = 81920, 256, 94400
 DEFAULT_SOURCE = "20261111-044057_four_conditions"
-TRAIN_DEFAULTS = {"dim": 384, "heads": 6, "wd": 0.05, "ema": 0.999,
-                  "warmup": 300, "lr_min": 3e-5}
+TRAIN_DEFAULTS = {"dim": 384, "depth": 8, "heads": 6, "wd": 0.05, "ema": 0.999,
+                  "warmup": 300, "lr": 3e-4, "lr_min": 3e-5, "change_weight": 8,
+                  "unroll": 1, "val_every": 500}
 
 
-def budget(F, episodes=EPISODES):
-    if F not in LEVELS or episodes <= 0:
-        raise ValueError("formation frames must be 0/8/16/32/48 and episodes positive")
-    clips = (64 - F) // 8
-    form = max(0, F - 1)
-    pairs = form + clips * 7
-    steps_per_epoch = math.ceil(episodes * pairs / BATCH)
-    return {"F": F, "formation_frames_fraction": F / 64, "operation_clips": clips,
-            "episodes": episodes, "frames": episodes * 64, "pairs_per_episode": pairs,
-            "pairs": episodes * pairs, "formation_pairs": form * episodes,
-            "formation_fraction": form / pairs, "epochs": EPOCHS,
-            "steps_per_epoch": steps_per_epoch, "steps": steps_per_epoch * EPOCHS,
-            "samples": episodes * pairs * EPOCHS}
+def formation_count(ratio, batch=BATCH):
+    if batch <= 0 or not np.isfinite(ratio) or not 0 <= ratio <= 1:
+        raise ValueError("ratio must be finite in [0,1] and batch positive")
+    n = ratio * batch
+    if not np.isclose(n, round(n), atol=1e-10, rtol=0):
+        raise ValueError("ratio * batch must be an integer; no silent rounding")
+    return int(round(n))
+
+
+def validate_ratios(ratios):
+    ratios = tuple(float(v) for v in ratios)
+    for ratio in ratios:
+        formation_count(ratio)
+    if ratios != tuple(sorted(set(ratios))) or not {0.0, 0.5}.issubset(ratios):
+        raise ValueError("ratios must be sorted, distinct, and include 0 and 0.5")
+    return ratios
+
+
+def dose_key(ratio):
+    return f"r{formation_count(ratio):03d}"
+
+
+def budget(ratio, steps=STEPS):
+    if steps <= 0 or not isinstance(steps, int):
+        raise ValueError("updates must be a positive integer")
+    n = formation_count(ratio)
+    return {"formation_ratio": ratio, "steps": steps, "batch": BATCH,
+            "samples": steps * BATCH, "formation_per_batch": n, "operation_per_batch": BATCH - n,
+            "formation_samples": steps * n, "operation_samples": steps * (BATCH - n),
+            "sampling": "stratified_with_replacement", "epochs": None}
 
 
 def check_output_tree(out):
@@ -75,49 +92,49 @@ def run_lock(out):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def validate_levels(levels):
-    levels = tuple(levels)
-    if (levels != tuple(sorted(set(levels))) or not {0, 32}.issubset(levels)
-            or not set(levels).issubset(LEVELS) or len(levels) < 3):
-        raise ValueError("levels must be sorted distinct doses, including F=0/32 and at least one new dose")
-    return levels
+def array_sha1(array):
+    return hashlib.sha1(np.ascontiguousarray(array).tobytes()).hexdigest()
 
 
-def new_levels(manifest):
-    return tuple(F for F in validate_levels(manifest["protocol"]["levels"]) if F not in (0, 32))
+def protocol(ratios=RATIOS, steps=STEPS):
+    ratios = validate_ratios(ratios)
+    budget(ratios[0], steps)
+    return {"mode": MODE, "episodes": EPISODES, "condition": "process", "trajectory_frames": 64,
+            "formation_frames": 32, "operation_clips": 4, "ratios": list(ratios), "steps": steps,
+            "batch": BATCH, "epochs": None, "training_seeds": [0], "train_defaults": TRAIN_DEFAULTS,
+            "sampling": "stratified_with_replacement", "pair_protocol": "video",
+            "all_doses_retrained": True, "reuse_main_endpoints": False}
 
 
-def validate_source(value, levels=LEVELS):
-    levels = validate_levels(levels)
+def validate_source(value, ratios=RATIOS, steps=STEPS):
+    p = protocol(ratios, steps)
     source = helpers.source_path(value)
-    print(f"[05] validating completed source: {common.rel(source)}", flush=True)
-    _, _, models, audited = import_module(f"{MAIN_PACKAGE}.analysis").load_results(source)
+    print(f"[05] checking frozen experiment 03 source: {common.rel(source)}", flush=True)
+    _, _, _, audited = import_module(f"{MAIN_PACKAGE}.analysis").load_results(source)
     inputs = {k: resolve_file(v) for k, v in audited["inputs"].items()}
-    endpoints = {"0": models["state"], "32": models["process"]}
-    endpoint_hashes = {}
-    for F, path in endpoints.items():
-        out = resolve_file(path)
-        args = common.load_json(out / "config.json")["args"]
-        if any(args.get(k) != value for k, value in TRAIN_DEFAULTS.items()):
-            raise ValueError("source model hyperparameters differ from the matched dose protocol")
-        endpoint_hashes[F] = {n: common.sha1_file(out / n) for n in
-                              ("config.json", "done.json", "ckpt.pt", "eval.json", "eval_samples.npz")}
-    manifest = {"version": VERSION, "source_run": common.rel(source), "source_audit_sha1": common.sha1_file(source / "audit.json"),
-                "inputs": audited["inputs"], "hashes": audited["hashes"],
-                "endpoints": endpoints, "endpoint_hashes": endpoint_hashes,
-                "protocol": {"episodes": EPISODES, "epochs": EPOCHS, "batch": BATCH,
-                             "training_seeds": [0], "levels": list(levels), "sampling": "full_epochs",
-                             "full_five_dose_design": levels == LEVELS, "train_defaults": TRAIN_DEFAULTS,
-                             "formation_mode": "compress", "settle_frames": 4}}
-    return {"source": source, "audited": audited, "inputs": inputs, "manifest": manifest}
+    manifest = {"version": VERSION, "source_run": common.rel(source),
+                "source_audit_sha1": common.sha1_file(source / "audit.json"),
+                "inputs": audited["inputs"], "hashes": audited["hashes"], "protocol": p}
+    return {"source": source, "inputs": inputs, "audited": audited, "manifest": manifest}
+
+
+def require_current(recorded):
+    if recorded.get("version") != VERSION or recorded.get("protocol", {}).get("mode") != MODE:
+        raise ValueError("this run uses the retired frame-compression protocol; keep it unchanged and create a new supervision_ratio run")
 
 
 def bind_run(name, bundle):
     out = run_path(name)
     helpers.forbid_source_output(out, bundle["source"], bundle["audited"])
     path = out / "source.json"
-    if path.exists() and common.load_json(path) != bundle["manifest"]:
-        raise ValueError("source identity or protocol changed; use a new experiment 05 run")
+    if path.exists():
+        require_current(common.load_json(path))
+        if common.load_json(path) != bundle["manifest"]:
+            raise ValueError("source or sampling budget changed; use a new experiment 05 run")
+    elif out.exists() and any(p.name != "pipeline.lock" for p in out.iterdir()):
+        metadata_only = set(p.name for p in out.iterdir()) <= {"pipeline.lock", "run.json"}
+        if not metadata_only:
+            raise ValueError("unbound output directory is not empty; use a new run")
     common.start_run(EXP_NAME, name=name)
     if not path.exists():
         write_json(path, bundle["manifest"])
@@ -125,61 +142,84 @@ def bind_run(name, bundle):
 
 
 def verify_manifest(name):
-    out = run_path(name)
-    recorded = common.load_json(out / "source.json")
-    bundle = validate_source(recorded["source_run"], recorded["protocol"]["levels"])
-    if recorded != bundle["manifest"]:
-        raise ValueError("frozen source or endpoint models changed")
+    recorded = common.load_json(run_path(name) / "source.json")
+    require_current(recorded)
+    p = recorded["protocol"]
+    bundle = validate_source(recorded["source_run"], p["ratios"], p["steps"])
+    if bundle["manifest"] != recorded:
+        raise ValueError("frozen source identity or sampling protocol changed")
     return bundle
 
 
-def variant_hashes(path):
-    return {name: common.sha1_file(Path(path) / name) for name in
-            ("train_process.npz", "train_process_actions.json", "train_summary.json")}
+def training_args(name, ratio, audited):
+    p = audited["protocol"]
+    b = budget(ratio, p["steps"])
+    key = dose_key(ratio)
+    return {**TRAIN_DEFAULTS, "condition": "process", "episodes": p["episodes"], "steps": b["steps"],
+            "batch": BATCH, "formation_ratio": ratio, "protocol": "video", "seed": 0, "epochs": None,
+            "sampling_mode": MODE, "select_best_val": True, "log_batch_composition": True,
+            "data": audited["inputs"]["data"], "val": audited["inputs"]["val"], "run": name,
+            "id": f"{key}_seed0", "out": common.rel(run_path(name) / "train" / f"{key}_seed0"),
+            "device": "auto", "log_every": 50}
 
 
-def verify_variant(path, source, F):
-    path = Path(path)
-    marker = common.load_json(path / "complete.json")
-    if (F not in (8, 16, 48) or marker.get("version") != VERSION
-            or marker.get("source") != source or marker.get("F") != F
-            or marker.get("episodes") != EPISODES or marker.get("mode") != "compress"
-            or marker.get("budget") != budget(F)
-            or marker.get("hashes") != variant_hashes(path)):
-        raise ValueError(f"F={F} data identity changed; refusing regeneration or training")
-    return marker
+def expected_data_hashes(audited, kind):
+    condition = "process" if kind == "data" else "state"
+    return {k: audited["hashes"][kind][k] for k in
+            (f"train_{condition}.npz", f"train_{condition}_actions.json", "train_summary.json")}
 
 
 def validate_config(out, row, audited):
     cfg = common.load_json(Path(out) / "config.json")
-    b = budget(row["F"])
-    expected = {**TRAIN_DEFAULTS, "condition": "process", "episodes": EPISODES, "epochs": EPOCHS, "steps": b["steps"],
-                "batch": BATCH, "protocol": "video", "seed": 0, "lr": 3e-4, "depth": 8,
-                "change_weight": 8, "unroll": 1, "balanced_phases": False,
-                "select_best_val": True, "val_every": 500, "log_batch_composition": True,
-                "data": row["data"], "val": audited["inputs"]["val"]}
-    if any(cfg["args"].get(k) != v for k, v in expected.items()):
-        raise ValueError("formation-ratio training has different settings")
-    if (cfg.get("data_sha1") != audited["variants"][str(row["F"])]["hashes"]
-            or cfg.get("val_sha1") != {k: audited["hashes"]["val"][k] for k in
-                                       ("train_state.npz", "train_state_actions.json", "train_summary.json")}):
-        raise ValueError("training data or validation identity changed")
+    expected = training_args(row["run"], row["formation_ratio"], audited)
+    if any(cfg.get("args", {}).get(k) != v for k, v in expected.items()):
+        raise ValueError("training configuration differs from the supervision sampling protocol")
+    if (cfg.get("version") != VERSION or cfg.get("data_sha1") != expected_data_hashes(audited, "data")
+            or cfg.get("val_sha1") != expected_data_hashes(audited, "val")
+            or cfg.get("pools") != audited["pools"]):
+        raise ValueError("training inputs or pair pools differ from the audited source")
     return cfg
 
 
 def validate_done(out, row, audited):
     validate_config(out, row, audited)
     done = common.load_json(Path(out) / "done.json")
-    b = budget(row["F"])
-    if (any(done.get(k) != b[k] for k in ("steps", "epochs", "steps_per_epoch"))
-            or done.get("samples_seen") != b["samples"] or done.get("n_pairs") != b["pairs"]
-            or done.get("selection") != "val_cascade_acc"
-            or done.get("best_step") not in [k * b["steps_per_epoch"] for k in range(1, EPOCHS + 1)]
-            or not np.isclose(done.get("form_frac_mean", -1), b["formation_fraction"], atol=1e-6, rtol=0)):
-        raise ValueError("incomplete epoch coverage or incorrect formation dose")
-    if done.get("ckpt_sha1") != common.sha1_file(Path(out) / "ckpt.pt"):
-        raise ValueError("checkpoint identity changed")
+    b = budget(row["formation_ratio"], audited["protocol"]["steps"])
+    expected = {"version": VERSION, "sampling_mode": MODE, "steps": b["steps"], "epochs": None,
+                "steps_per_epoch": None, "samples_seen": b["samples"], "formation_samples_seen": b["formation_samples"],
+                "operation_samples_seen": b["operation_samples"], "formation_ratio": row["formation_ratio"],
+                "form_frac_mean": row["formation_ratio"], "n_pairs": audited["pools"]["total"],
+                "selection": "val_cascade_acc"}
+    if any(done.get(k) != v for k, v in expected.items()):
+        raise ValueError("incomplete updates or incorrect formation/operation exposure")
+    best = done.get("best_step", 0)
+    if (not isinstance(best, int) or best <= 0 or best > b["steps"]
+            or (best != b["steps"] and best % TRAIN_DEFAULTS["val_every"] != 0)
+            or not isinstance(done.get("best_val"), dict)
+            or done.get("ckpt_sha1") != common.sha1_file(Path(out) / "ckpt.pt")):
+        raise ValueError("invalid selected validation checkpoint or checkpoint identity")
+    validate_checkpoint(out, training_args(row["run"], row["formation_ratio"], audited), done)
     return done
+
+
+def validate_checkpoint(out, args, done):
+    import torch
+    try:
+        ckpt = torch.load(Path(out) / "ckpt.pt", map_location="cpu", weights_only=True)
+        model = import_module(f"{PACKAGE}.model").build_model(
+            {k: args[k] for k in ("dim", "depth", "heads")})
+        if (ckpt.get("args") != args or ckpt.get("cfg") != model.cfg
+                or ckpt.get("step") != done["best_step"] or ckpt.get("selection") != "val_cascade_acc"):
+            raise ValueError("checkpoint internal identity differs from this ratio's selected model")
+        ema = ckpt["ema"]
+        if not all(torch.is_tensor(v) and torch.isfinite(v).all() for v in ema.values()):
+            raise ValueError("checkpoint EMA contains invalid or nonfinite weights")
+        model.load_state_dict(ema, strict=True)
+        score = done["best_val"].get("cascade_acc", float("nan"))
+        if not np.isfinite(score) or not 0 <= score <= 1:
+            raise ValueError("selected validation score is invalid")
+    except Exception as exc:
+        raise ValueError(f"cannot validate the selected supervision checkpoint: {exc}") from exc
 
 
 def validate_metrics(samples, bench):
@@ -192,9 +232,8 @@ def validate_metrics(samples, bench):
     for i in range(n):
         initial = (bench["ctx_fg"][i], bench["ctx_bg"][i])
         for k in range(2):
-            predicted = (samples["pred_fg"][i, k], samples["pred_bg"][i, k])
-            target = (bench["fut_fg"][i, k, -1], bench["fut_bg"][i, k, -1])
-            score = metrics.score_sample(predicted, target, initial, bench["A"][i, k])
+            score = metrics.score_sample((samples["pred_fg"][i, k], samples["pred_bg"][i, k]),
+                (bench["fut_fg"][i, k, -1], bench["fut_bg"][i, k, -1]), initial, bench["A"][i, k])
             for key in ("change_f1", "any_violation"):
                 if not np.isclose(score[key], samples[key][i, k], atol=1e-10, rtol=0):
                     raise ValueError(f"cached {key} differs from predicted states")
@@ -202,27 +241,33 @@ def validate_metrics(samples, bench):
 
 def evaluation_identity(out, done):
     return {"version": VERSION, "checkpoint_sha1": done["ckpt_sha1"],
-            "hashes": {name: common.sha1_file(Path(out) / name) for name in ("eval.json", "eval_samples.npz")}}
+            "hashes": {n: common.sha1_file(Path(out) / n) for n in ("eval.json", "eval_samples.npz")}}
 
 
 def validate_eval(out, audited, done):
     out = Path(out)
-    result = main_shared.validate_evaluation(out, audited, done)
+    ev = common.load_json(out / "eval.json")
+    bench_path = resolve_file(audited["inputs"]["bench"])
+    if (ev.get("bench") != common.rel(bench_path) or ev.get("n_samples") != 512
+            or ev.get("bench_sha1") != audited["hashes"]["bench"][bench_path.name]
+            or ev.get("bench_json_sha1") != audited["hashes"]["bench"][bench_path.with_suffix(".json").name]
+            or ev.get("checkpoint_sha1") != done["ckpt_sha1"]):
+        raise ValueError("evaluation differs from the frozen bench or selected checkpoint")
     marker = out / "eval_complete.json"
     if marker.exists() and common.load_json(marker) != evaluation_identity(out, done):
         raise ValueError("completed evaluation identity changed; refusing overwrite")
-    bench = common.load_bench(resolve_file(audited["inputs"]["bench"]))
+    bench = common.load_bench(bench_path)
     with np.load(out / "eval_samples.npz", allow_pickle=False) as z:
         samples = {k: z[k] for k in ("cascade_f1", "change_f1", "cell_acc_mask", "rank_acc", "any_violation",
                                     "split_ids", "rank_valid", "n_cascade_true", "pred_fg", "pred_bg")}
     if len(samples["split_ids"]) != 512:
         raise ValueError("incomplete evaluation samples")
     validate_metrics(samples, bench)
-    return result
+    return ev
 
 
 def record_eval(out, audited, done):
     validate_eval(out, audited, done)
-    marker = Path(out) / "eval_complete.json"
-    if not marker.exists():
-        write_json(marker, evaluation_identity(out, done))
+    path = Path(out) / "eval_complete.json"
+    if not path.exists():
+        write_json(path, evaluation_identity(out, done))

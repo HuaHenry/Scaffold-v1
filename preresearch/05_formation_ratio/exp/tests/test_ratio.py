@@ -1,504 +1,539 @@
-from contextlib import ExitStack
 from copy import deepcopy
 from importlib import import_module
-import io
+import json
 from pathlib import Path
-import zipfile
+from threading import Event
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
-from exp import analysis, audit, generate_data as gen, main, make_jobs, run_queue, shared
+from exp import analysis, audit, generate_data, main, make_jobs, run_queue, shared, train_ratio as trainer
 import datasets as D
 import datasets_v3 as v3
 
 
-def tower_episode(index=0):
-    actions = [D.act_dict(D.place(10 + index, D.FLOOR - j, D.STONE)) for j in range(5)]
-    script = [[(v3.to_action(a), "build")] for a in actions] + [[] for _ in range(22)]
-    snapshots, world, ok = v3.run_formation(script, D.int_seed(0, "world", index), 32)
-    assert ok
-    formed = D.pack(snapshots, [0] * 32)
-    operation = D.op_clip(world.grid, world.background, D.Action("remove", 10 + index, D.FLOOR), 0)
-    state = D.pack(operation * 8, [1] * 64)
-    return formed, state
+@pytest.fixture(autouse=True)
+def cpu_threads():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield
+    torch.set_num_threads(previous)
+
+
+def write_small_data(path, episodes=2):
+    path.mkdir()
+    formed, operated, scenes = [], [], []
+    for i in range(episodes):
+        actions = [D.act_dict(D.place(10 + i, D.FLOOR - j, D.STONE)) for j in range(5)]
+        script = [[(v3.to_action(a), "build")] for a in actions] + [[] for _ in range(22)]
+        snapshots, world, ok = v3.run_formation(script, D.int_seed(0, "world", i), 32)
+        assert ok
+        f = D.pack(snapshots, [0] * 32)
+        operation = D.op_clip(world.grid, world.background, D.Action("remove", 10 + i, D.FLOOR), 0)
+        o = D.pack(operation * 8, [1] * 64)
+        formed.append(f)
+        operated.append(o)
+        scenes.append({"kind": "tower", "n_struct": 1, "final_hash": D.state_hash(world.grid, world.background)})
+    arrays = {key: np.stack([np.concatenate((f[key], o[key][:32])) for f, o in zip(formed, operated)])
+              for key in ("fg", "bg", "phase", "cont")}
+    arrays["phase"] = arrays["phase"].astype(np.int8)
+    shared.write_npz(path / "train_process.npz", arrays)
+    shared.write_json(path / "train_process_actions.json", {"scenes": ["tower"] * episodes,
+        "actions": [f["actions"] + o["actions"][:32] for f, o in zip(formed, operated)]})
+    shared.write_npz(path / "train_state.npz", {k: np.stack([o[k] for o in operated]) for k in arrays})
+    shared.write_json(path / "train_state_actions.json", {"actions": [o["actions"] for o in operated]})
+    shared.write_json(path / "train_scenes.json", scenes)
+    shared.write_json(path / "train_summary.json", {"layout": {"formation": 32, "clip": 8},
+        "conditions": {"process": {"episodes": episodes}, "state": {"episodes": episodes}}})
+    return arrays
 
 
 @pytest.fixture
-def small_source(tmp_path, monkeypatch):
-    n = 4
-    original_budget = shared.budget
-    for module in (shared, gen, audit):
-        monkeypatch.setattr(module, "EPISODES", n)
-        monkeypatch.setattr(module, "budget", lambda F: original_budget(F, n))
+def source(tmp_path, monkeypatch):
     monkeypatch.setattr(shared.common, "RESULTS_ROOT", tmp_path / "results")
+    monkeypatch.setattr(shared, "TRAIN_DEFAULTS", {**shared.TRAIN_DEFAULTS, "dim": 12, "depth": 1, "heads": 3})
     data = tmp_path / "frozen"
-    data.mkdir()
-    episodes = [tower_episode(i) for i in range(n)]
-    arrays = {k: np.stack([state[k] for _, state in episodes]) for k in ("fg", "bg", "cont", "phase")}
-    state_actions = [state["actions"] for _, state in episodes]
-    formation = [formed["actions"] + state["actions"][:32] for formed, state in episodes]
-    shared.write_npz(data / "train_state.npz", arrays)
-    shared.write_json(data / "train_state_actions.json", {"actions": state_actions})
-    shared.write_json(data / "train_process_actions.json", {"actions": formation})
-    shared.write_json(data / "train_scenes.json", [{"kind": "tower", "n_struct": 1,
-        "final_hash": D.state_hash(state["fg"][0], state["bg"][0])} for _, state in episodes])
-    hashes = {p.name: shared.common.sha1_file(p) for p in data.iterdir()}
-    inputs = {"data": str(data), "val": str(tmp_path / "validation"), "bench": str(tmp_path / "bench.npz")}
-    manifest = {"version": shared.VERSION, "hashes": {"data": hashes}, "endpoints": {"0": "source0", "32": "source32"},
-                "protocol": {"levels": list(shared.LEVELS), "training_seeds": [0]}}
-    bundle = {"source": tmp_path / "source03", "inputs": {k: Path(v) for k, v in inputs.items()},
-              "manifest": manifest, "audited": {"inputs": inputs, "hashes": {"data": hashes}}}
+    arrays = write_small_data(data)
+    p = shared.protocol(steps=1000)
+    p["episodes"] = 2
+    inputs = {"data": str(data), "val": str(data), "bench": str(tmp_path / "bench.npz")}
+    hashes = {"data": {f.name: shared.common.sha1_file(f) for f in data.iterdir()},
+              "val": shared.common.data_hashes(data, "state"), "bench": {}}
+    manifest = {"version": 2, "source_run": "source03", "inputs": inputs, "hashes": hashes,
+                "source_audit_sha1": "frozen", "protocol": p}
+    bundle = {"source": tmp_path / "source03", "manifest": manifest,
+              "inputs": {k: Path(v) for k, v in inputs.items()}, "audited": {"inputs": inputs, "hashes": hashes}}
     out = shared.bind_run("unit", bundle)
-    return bundle, out, arrays, state_actions, formation
+    return bundle, out, arrays
 
 
-@pytest.mark.parametrize("F,pairs,steps", [(0, 56, 89600), (8, 56, 89600), (16, 57, 91200), (32, 59, 94400), (48, 61, 97600)])
-def test_exact_budget_and_real_video_boundaries(F, pairs, steps):
-    b = shared.budget(F)
-    assert b["pairs_per_episode"] == pairs
-    assert b["steps"] == steps
-    assert b["samples"] == 81920 * pairs * 5
-    assert sum(end - start - 1 for start, end in shared.common.segments("process", {"formation": F, "clip": 8}, 64)) == pairs
-    assert b["formation_fraction"] == pytest.approx(max(0, F - 1) / pairs)
+@pytest.mark.parametrize("ratio,n", [(0, 0), (.125, 32), (.25, 64), (.5, 128), (.75, 192)])
+def test_equal_update_budget_and_exact_exposure(ratio, n):
+    b = shared.budget(ratio)
+    assert b["steps"] == 94400 and b["batch"] == 256
+    assert b["samples"] == 24166400
+    assert b["formation_per_batch"] == n
+    assert b["formation_samples"] == 94400 * n
+    assert b["formation_samples"] + b["operation_samples"] == b["samples"]
+    assert b["epochs"] is None
 
 
-@pytest.mark.parametrize("levels", [(), (0, 32), (0, 8, 16), (0, 32, 64), (0, 32, 16), (0, 16, 16, 32)])
-def test_invalid_levels_are_not_silently_changed(levels):
+@pytest.mark.parametrize("value", [-1, 1.1, .1, np.nan, np.inf])
+def test_invalid_or_nonintegral_ratios_are_rejected(value):
     with pytest.raises(ValueError):
-        shared.validate_levels(levels)
+        shared.formation_count(value)
 
 
-def test_explicit_fallback_preserves_both_endpoints():
-    assert shared.validate_levels((0, 16, 32, 48)) == (0, 16, 32, 48)
-    assert shared.new_levels({"protocol": {"levels": [0, 16, 32, 48]}}) == (16, 48)
+@pytest.mark.parametrize("values", [[], [0], [.125, .5], [0, .5, .5], [.5, 0], [0, np.nan, .5]])
+def test_invalid_ratio_design_is_not_silently_changed(values):
+    with pytest.raises(ValueError):
+        shared.validate_ratios(values)
 
 
-@pytest.mark.parametrize("name", ["", ".", "..", "../bad", "a/b"])
-def test_run_names_cannot_escape_result_folder(name):
+@pytest.mark.parametrize("value", [0, -1, 1.5])
+def test_invalid_update_budget(value):
+    with pytest.raises(ValueError):
+        shared.budget(.5, value)
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "a/b", "../escape"])
+def test_names_cannot_escape_output_root(name):
     with pytest.raises(ValueError):
         shared.run_path(name)
 
 
-def test_balanced_partition_preserves_all_actions():
-    actions = [{"type": "place", "x": i, "y": 0} for i in range(23)]
-    frames = gen.partition_actions(actions, 3)
-    assert sorted(map(len, frames)) == [7, 8, 8]
-    assert sum(frames, []) == actions
-    assert gen.partition_actions([], 3) == [[], [], []]
-    assert len(gen.partition_actions(actions[:2], 43)) == 43
+@pytest.mark.parametrize("ratio", [0, .125, .25, .5, .75, 1])
+def test_stratified_sampler_exact_ratio_and_reproducibility(ratio):
+    pools = (torch.arange(31), torch.arange(31, 59))
+    g1, g2 = (torch.Generator().manual_seed(9) for _ in range(2))
+    for _ in range(3):
+        a = trainer.sample_ratio_batch(pools, 256, ratio, g1)
+        b = trainer.sample_ratio_batch(pools, 256, ratio, g2)
+        assert torch.equal(a, b)
+        assert int((a < 31).sum()) == shared.formation_count(ratio)
+        assert len(a) == 256 and int(a.min()) >= 0 and int(a.max()) < 59
+    assert len(torch.unique(a)) < len(a)
 
 
-def test_front_back_same_cell_must_use_different_tokens():
-    actions = [{"type": "place", "x": 3, "y": 4, "layer": layer} for layer in ("front", "back")]
-    assert gen.partition_actions(actions, 2) == [[actions[0]], [actions[1]]]
-    with pytest.raises(ValueError, match="repeated-cell"):
-        gen.partition_actions(actions * 2, 3)
+def test_zero_ratio_does_not_require_a_formation_pool():
+    pools = (torch.empty(0, dtype=torch.long), torch.arange(3))
+    ids = trainer.sample_ratio_batch(pools, 16, 0, torch.Generator().manual_seed(0))
+    assert len(ids) == 16
+    with pytest.raises(ValueError, match="empty"):
+        trainer.sample_ratio_batch(pools, 16, .5, torch.Generator())
 
 
-@pytest.mark.parametrize("F", [8, 16, 48])
-def test_replay_complete_formation_and_nested_operations(F):
-    formed, state = tower_episode()
-    episode, stats = gen.build_episode(F, 0, formed["actions"], state)
-    assert stats["n_actions"] == 5
-    audit.validate_episode(episode, episode["actions"], state, state["actions"], formed["actions"], F)
-    assert episode["fg"].shape == (64, 28, 56)
-    assert sum(episode["cont"]) == shared.budget(F)["pairs_per_episode"]
-    assert not any(episode["actions"][F - 4:F])
+def test_phases_are_checked_and_no_reset_pairs_are_drawn(source):
+    bundle, _, _ = source
+    data = trainer.pilot.Data(bundle["inputs"]["data"], "process", "video", 2, torch.device("cpu"))
+    pools = trainer.phase_pools(data.pairs, data.phase)
+    assert [len(p) for p in pools] == [62, 56]
+    assert not torch.isin(data.pairs[:, 1], torch.tensor([0, 32, 40, 48, 56])).any()
+    before = data.phase.clone()
+    data.phase[data.pairs[0, 0], data.pairs[0, 1]] = 3
+    with pytest.raises(ValueError, match="phases"):
+        trainer.phase_pools(data.pairs, data.phase)
+    data.phase.copy_(before)
 
 
-@pytest.mark.parametrize("mutation", ["operation", "action_order", "final", "phase", "reset"])
-def test_episode_audit_rejects_protocol_changes(mutation):
-    formed, state = tower_episode()
-    episode, _ = gen.build_episode(16, 0, formed["actions"], state)
-    if mutation == "operation":
-        episode["fg"][16, 0, 0] = 9
-    elif mutation == "action_order":
-        frame = next(frame for frame in episode["actions"][:16] if frame)
-        frame.append(frame[0])
-    elif mutation == "final":
-        episode["fg"][15, 0, 0] = 9
-    elif mutation == "phase":
-        episode["phase"][1] = 1
+def test_preparation_audits_original_data_without_frame_outputs(source):
+    bundle, out, arrays = source
+    before = {p.name: shared.common.sha1_file(p) for p in bundle["inputs"]["data"].iterdir()}
+    audited = audit.audit_sampling(bundle, "unit")
+    assert audited["pools"]["formation"] == 62 and audited["pools"]["operation"] == 56
+    assert audited["pools"]["natural_formation_share"] == pytest.approx(31 / 59)
+    assert audited["scene_distribution"]["scene_types"] == {"tower": 2}
+    assert audited["inherited_action_encoding"]["collision_frames"] == 0
+    assert audit.audit_sampling(bundle, "unit") == audited
+    assert not (out / "data").exists() and not (out / "cache").exists()
+    assert before == {p.name: shared.common.sha1_file(p) for p in bundle["inputs"]["data"].iterdir()}
+
+
+@pytest.mark.parametrize("key", ["phase", "cont", "shape", "actions", "scenes"])
+def test_population_rejects_invalid_original_boundaries_or_identity(source, key):
+    bundle, _, arrays = source
+    data = bundle["inputs"]["data"]
+    if key == "phase":
+        arrays["phase"][0, 1] = 1
+        shared.write_npz(data / "train_process.npz", arrays)
+    elif key == "cont":
+        arrays["cont"][0, 32] = True
+        shared.write_npz(data / "train_process.npz", arrays)
+    elif key == "shape":
+        arrays["fg"] = arrays["fg"][:1]
+        shared.write_npz(data / "train_process.npz", arrays)
+    elif key == "actions":
+        payload = shared.common.load_json(data / "train_process_actions.json")
+        payload["actions"][0].pop()
+        shared.write_json(data / "train_process_actions.json", payload)
     else:
-        episode["cont"][16] = True
+        payload = shared.common.load_json(data / "train_process_actions.json")
+        payload["scenes"][0] = "changed"
+        shared.write_json(data / "train_process_actions.json", payload)
     with pytest.raises(ValueError):
-        audit.validate_episode(episode, episode["actions"], state, state["actions"], formed["actions"], 16)
+        audit.population(data, 2)
 
 
-def test_replay_rejects_final_changes_and_source_layout():
-    formed, state = tower_episode()
-    wrong = state["fg"][0].copy()
-    wrong[0, 0] = 1
-    with pytest.raises(ValueError, match="final structure"):
-        gen.replay_formation(formed["actions"], 8, 0, wrong, state["bg"][0])
-    with pytest.raises(ValueError, match="exactly 32"):
-        gen.replay_formation(formed["actions"][:8], 8, 0, wrong, state["bg"][0])
+def test_inherited_same_cell_encoding_is_recorded_not_newly_merged(source):
+    bundle, _, _ = source
+    path = bundle["inputs"]["data"] / "train_process_actions.json"
+    payload = shared.common.load_json(path)
+    frame = payload["actions"][0][1]
+    frame.append({**frame[0], "layer": "back"})
+    shared.write_json(path, payload)
+    before = path.read_bytes()
+    result = audit.population(bundle["inputs"]["data"], 2)
+    assert result["inherited_action_encoding"]["collision_frames"] == 1
+    assert path.read_bytes() == before
 
 
-def test_source_cache_integrity_and_manifest_reuse(small_source):
-    bundle, out, arrays, _, _ = small_source
-    cached, _, _ = gen.cache_arrays(bundle, out)
-    assert all(isinstance(v, np.memmap) for v in cached.values())
-    for k in arrays:
-        np.testing.assert_array_equal(cached[k], arrays[k])
-    before = (out / "source.json").read_bytes()
-    shared.bind_run("unit", bundle)
-    assert (out / "source.json").read_bytes() == before
-    changed = deepcopy(bundle)
-    changed["manifest"]["protocol"]["levels"] = [0, 16, 32, 48]
-    with pytest.raises(ValueError, match="changed"):
-        shared.bind_run("unit", changed)
-    with (out / "cache/fg.npy").open("ab") as file:
-        file.write(b"changed")
-    with pytest.raises(ValueError, match="cache changed"):
-        gen.cache_arrays(bundle, out)
+def test_pool_fingerprints_match_actual_training_data(source):
+    bundle, _, _ = source
+    population = audit.population(bundle["inputs"]["data"], 2)
+    data = trainer.pilot.Data(bundle["inputs"]["data"], "process", "video", 2, torch.device("cpu"))
+    pools = trainer.phase_pools(data.pairs, data.phase)
+    trainer.verify_pools(data, pools, population["pools"])
+    broken = deepcopy(population["pools"])
+    broken["pairs_sha1"] = "changed"
+    with pytest.raises(ValueError, match="pools"):
+        trainer.verify_pools(data, pools, broken)
 
 
-def test_preflight_failure_blocks_all_generation_and_training(small_source, monkeypatch):
-    bundle, out, arrays, actions, formation = small_source
-    original = gen.replay_formation
-
-    def fail_on_one_scene(frames, F, index, fg, bg):
-        if F == 8 and index == 2:
-            raise ValueError("repeated-cell construction slots")
-        return original(frames, F, index, fg, bg)
-
-    monkeypatch.setattr(gen, "replay_formation", fail_on_one_scene)
-    monkeypatch.setattr(gen, "create_variant", lambda *a, **k: pytest.fail("generation must not start"))
-    with pytest.raises(ValueError, match="No training started"):
-        gen.prepare_all(bundle, "unit", workers=1, chunk=2, preflight_count=4)
-    report = shared.common.load_json(out / "formation_preflight.json")
-    assert report["status"] == "blocked"
-    assert report["failures"][0]["episode"] == 2
-    assert not (out / "data").exists()
-
-
-def test_variants_full_assembly_audit_and_no_replay_on_resume(small_source, monkeypatch):
-    bundle, out, arrays, actions, formation = small_source
-    gen.prepare_all(bundle, "unit", workers=1, chunk=2, preflight_count=4)
-    report = audit.audit_variants(bundle, "unit")
-    assert set(report["variants"]) == {"8", "16", "48"}
-    assert report["scene_distribution"]["scene_types"] == {"tower": 4}
-    monkeypatch.setattr(gen, "replay_formation", lambda *a, **k: pytest.fail("completed data must not be replayed"))
-    gen.prepare_all(bundle, "unit", workers=1, chunk=2, preflight_count=4)
-    assert audit.audit_variants(bundle, "unit") == report
-    target = out / "data/f16/train_process.npz"
-    with np.load(target) as z:
-        broken = {k: z[k] for k in z.files}
-    broken["fg"][0, 0, 0, 0] = 5
-    shared.write_npz(target, broken)
-    with pytest.raises(ValueError, match="identity changed"):
-        shared.verify_variant(target.parent, bundle["manifest"], 16)
-    marker = shared.common.load_json(target.parent / "complete.json")
-    marker["hashes"] = shared.variant_hashes(target.parent)
-    shared.write_json(target.parent / "complete.json", marker)
-    with pytest.raises(ValueError, match="arrays differ"):
-        audit.audit_variants(bundle, "unit")
-
-
-def test_explicit_reduced_generation_does_not_create_f8(small_source):
-    bundle, out, arrays, actions, formation = small_source
-    bundle["manifest"]["protocol"]["levels"] = [0, 16, 32, 48]
-    gen.prepare_all(bundle, "unit", workers=1, chunk=2, preflight_count=4)
-    assert not (out / "data/f8").exists()
-    assert set(audit.audit_variants(bundle, "unit")["variants"]) == {"16", "48"}
-
-
-@pytest.mark.parametrize("error", ["truncated", "different"])
-def test_stream_comparison_catches_incomplete_and_mismatched_arrays(error):
-    saved = np.arange(12, dtype=np.uint8).reshape(3, 4)
-    payload = saved.tobytes()[:-1] if error == "truncated" else bytes(12)
-    with pytest.raises(ValueError):
-        audit.compare_array_batch(io.BytesIO(payload), saved)
-
-
-def test_stream_reader_rejects_fortran_layout(tmp_path):
-    path = tmp_path / "arrays.npz"
-    values = np.asfortranarray(np.ones((4, 3), dtype=np.uint8))
-    shared.write_npz(path, {"fg": values})
-    with ExitStack() as stack:
-        z = stack.enter_context(zipfile.ZipFile(path))
-        with pytest.raises(ValueError, match="layout"):
-            audit.open_array_stream(z, stack, "fg", values)
-
-
-def test_jobs_use_absolute_inputs_and_only_selected_new_doses(tmp_path, monkeypatch):
-    monkeypatch.setattr(shared.common, "RESULTS_ROOT", tmp_path)
-    audited = {"protocol": {"levels": [0, 16, 32, 48]}, "inputs": {"val": str(tmp_path / "val")},
-               "variants": {str(F): {"data": shared.common.rel(tmp_path / f"f{F}")} for F in (16, 48)}}
-    rows = make_jobs.jobs("unit", audited)
-    assert [r["F"] for r in rows] == [16, 48]
-    trainer = import_module(f"{shared.PACKAGE}.train")
+def test_all_five_jobs_are_new_and_use_the_same_original_pools(source):
+    bundle, out, _ = source
+    audited = audit.audit_sampling(bundle, "unit")
+    rows = make_jobs.save_jobs("unit", audited)
+    assert [r["formation_ratio"] for r in rows] == list(shared.RATIOS)
+    assert len({r["out"] for r in rows}) == 5
     for row in rows:
-        args = trainer.get_args(row["cmd"][3:])
-        assert args.data.is_absolute()
-        assert args.epochs == 5 and args.seed == 0
-        assert args.select_best_val and not args.balanced_phases
-        assert args.steps == shared.budget(row["F"])["steps"]
-        assert args.dim == 384 and args.heads == 6
-        assert "05_formation_ratio/unit/" in row["out"]
-    make_jobs.save_jobs("unit", audited)
-    original = shared.run_path("unit") / "jobs/formation_ratio.json"
-    rows = shared.common.load_json(original)
-    rows[0]["F"] = 8
-    shared.write_json(original, rows)
-    with pytest.raises(ValueError, match="changed"):
+        assert row["cmd"][2] == "preresearch.05_formation_ratio.exp.train_ratio"
+        assert row["cwd"] == str(shared.PROJECT)
+        assert shared.resolve_file(row["out"]).is_relative_to(out / "train")
+        expected = shared.training_args("unit", row["formation_ratio"], audited)
+        assert expected["data"] == audited["inputs"]["data"]
+        assert expected["steps"] == 1000 and expected["epochs"] is None
+    assert make_jobs.save_jobs("unit", audited) == rows
+    rows[0]["steps"] = 999
+    shared.write_json(out / "jobs/formation_ratio.json", rows)
+    with pytest.raises(ValueError, match="job list changed"):
         make_jobs.save_jobs("unit", audited)
 
 
-def synthetic_scores(levels=shared.LEVELS):
+def test_old_compression_run_is_rejected_without_overwrite(source):
+    bundle, out, _ = source
+    old = {"version": 1, "protocol": {"formation_mode": "compress", "levels": [0, 16, 32, 48]}}
+    shared.write_json(out / "source.json", old)
+    before = (out / "source.json").read_bytes()
+    with pytest.raises(ValueError, match="retired"):
+        shared.bind_run("unit", bundle)
+    assert (out / "source.json").read_bytes() == before
+
+
+def test_changed_sampling_budget_requires_new_run(source):
+    bundle, out, _ = source
+    bundle = deepcopy(bundle)
+    bundle["manifest"]["protocol"]["steps"] += 1
+    before = (out / "source.json").read_bytes()
+    with pytest.raises(ValueError, match="budget changed"):
+        shared.bind_run("unit", bundle)
+    assert (out / "source.json").read_bytes() == before
+
+
+def test_symlink_output_cannot_point_to_frozen_source(source):
+    bundle, out, _ = source
+    (out / "train").symlink_to(bundle["inputs"]["data"], target_is_directory=True)
+    with pytest.raises(ValueError, match="symbolic link"):
+        shared.bind_run("unit", bundle)
+    with pytest.raises(ValueError, match="symbolic link"):
+        make_jobs.jobs("unit", {"protocol": bundle["manifest"]["protocol"], "inputs": bundle["manifest"]["inputs"]})
+
+
+def test_shared_run_lock_blocks_other_entrypoints(source, monkeypatch):
+    _, out, _ = source
+    with shared.run_lock(out):
+        for module in (audit, make_jobs, run_queue, analysis):
+            with pytest.raises(ValueError, match="another"):
+                module.main(["--run", "unit"])
+
+
+def completion_record(source, ratio=.25):
+    bundle, _, _ = source
+    audited = audit.audit_sampling(bundle, "unit")
+    row = next(row for row in make_jobs.jobs("unit", audited) if row["formation_ratio"] == ratio)
+    out = shared.resolve_file(row["out"])
+    out.mkdir(parents=True)
+    cfg = {"version": 2, "args": shared.training_args("unit", ratio, audited), "pools": audited["pools"],
+           "data_sha1": shared.expected_data_hashes(audited, "data"), "val_sha1": shared.expected_data_hashes(audited, "val")}
+    shared.write_json(out / "config.json", cfg)
+    model = trainer.models.build_model({k: cfg["args"][k] for k in ("dim", "depth", "heads")})
+    torch.save({"model": model.state_dict(), "ema": model.state_dict(), "cfg": model.cfg,
+        "step": 500, "selection": "val_cascade_acc", "args": cfg["args"]}, out / "ckpt.pt")
+    b = shared.budget(ratio, 1000)
+    done = {"version": 2, "sampling_mode": shared.MODE, "steps": 1000, "epochs": None, "steps_per_epoch": None,
+            "samples_seen": b["samples"], "formation_samples_seen": b["formation_samples"],
+            "operation_samples_seen": b["operation_samples"], "formation_ratio": ratio, "form_frac_mean": ratio,
+            "n_pairs": audited["pools"]["total"], "selection": "val_cascade_acc", "best_step": 500,
+            "best_val": {"cascade_acc": .7}, "ckpt_sha1": shared.common.sha1_file(out / "ckpt.pt")}
+    shared.write_json(out / "done.json", done)
+    return out, row, audited, cfg, done
+
+
+def test_training_completion_contract(source):
+    out, row, audited, _, done = completion_record(source)
+    assert shared.validate_done(out, row, audited) == done
+
+
+@pytest.mark.parametrize("key", ["formation_samples_seen", "operation_samples_seen", "steps", "epochs", "best_step", "ckpt_sha1"])
+def test_incorrect_exposure_or_checkpoint_is_not_reused(source, key):
+    out, row, audited, _, done = completion_record(source)
+    done[key] = "changed" if key == "ckpt_sha1" else 1
+    shared.write_json(out / "done.json", done)
+    with pytest.raises(ValueError):
+        shared.validate_done(out, row, audited)
+
+
+@pytest.mark.parametrize("key", ["seed", "dim", "formation_ratio", "data", "steps"])
+def test_changed_model_or_budget_settings_rejected(source, key):
+    out, row, audited, cfg, _ = completion_record(source)
+    cfg["args"][key] = "changed" if key == "data" else 99
+    shared.write_json(out / "config.json", cfg)
+    with pytest.raises(ValueError, match="configuration"):
+        shared.validate_done(out, row, audited)
+
+
+def tiny_fit(source, monkeypatch, ratio=.5):
+    bundle, out, _ = source
+    data = trainer.pilot.Data(bundle["inputs"]["data"], "process", "video", 2, torch.device("cpu"))
+    val = trainer.pilot.Data(bundle["inputs"]["data"], "state", "video", 2, torch.device("cpu"))
+    population = audit.population(bundle["inputs"]["data"], 2)
+    args = SimpleNamespace(**{**shared.TRAIN_DEFAULTS, "dim": 12, "depth": 1, "heads": 3,
+        "formation_ratio": ratio, "batch": 8, "steps": 3, "seed": 0, "log_every": 1, "val_every": 1})
+    original_model = trainer.models.build_model
+    monkeypatch.setattr(trainer.models, "build_model", lambda cfg: original_model({**cfg, "emb": 4}))
+    target = out / "tiny"
+    target.mkdir()
+    config = {"version": 2, "pools": population["pools"], "args": vars(args)}
+    done = trainer.fit(data, val, args, target, config)
+    return target, done, args
+
+
+@pytest.mark.parametrize("ratio", [0, .125, .25, .5, .75])
+def test_actual_cpu_training_ema_and_sample_counts(source, monkeypatch, ratio):
+    out, done, args = tiny_fit(source, monkeypatch, ratio)
+    assert done["samples_seen"] == 24
+    assert done["formation_samples_seen"] == 24 * ratio
+    assert done["operation_samples_seen"] == 24 * (1 - ratio)
+    assert done["epochs"] is None
+    checkpoint = torch.load(out / "ckpt.pt", map_location="cpu", weights_only=False)
+    assert checkpoint["step"] == done["best_step"]
+    assert checkpoint["selection"] == "val_cascade_acc"
+    assert all(torch.isfinite(v).all() for v in checkpoint["ema"].values())
+    logs = [json.loads(line) for line in (out / "train_log.jsonl").read_text().splitlines()]
+    assert len([r for r in logs if r.get("type") == "val"]) == 3
+    assert all(r["form_frac"] == ratio for r in logs if "form_frac" in r)
+
+
+def test_ties_select_earliest_ema_and_checkpoint_loads_in_existing_evaluator(source, monkeypatch):
+    monkeypatch.setattr(trainer.pilot, "transition_accuracy", lambda *a: {"cascade_acc": .5, "chg_acc": .5, "n_cascade": 2})
+    out, done, _ = tiny_fit(source, monkeypatch)
+    assert done["best_step"] == 1
+    evaluator = import_module(f"{shared.PACKAGE}.evaluate")
+    model, checkpoint = evaluator.load_run(out, "cpu")
+    assert checkpoint["step"] == done["best_step"]
+    assert model.cfg["dim"] == 12 and model.cfg["emb"] == 4
+    initial = torch.zeros((1, 28, 56), dtype=torch.long)
+    fg, bg = model.step(initial, initial, initial)
+    assert fg.shape == initial.shape and bg.shape == initial.shape
+
+
+def test_validation_failure_does_not_write_done(source, monkeypatch):
+    monkeypatch.setattr(trainer.pilot, "transition_accuracy", lambda *a: {"cascade_acc": .5, "n_cascade": 0})
+    with pytest.raises(ValueError, match="validation requires"):
+        tiny_fit(source, monkeypatch)
+    assert not (source[1] / "tiny/done.json").exists()
+
+
+def synthetic_scores(ratios=shared.RATIOS):
     ids = np.repeat(np.arange(4), 8)
-    scores = {F: {k: np.full(32, .2 + F / 320) for k in analysis.METRICS} for F in levels}
-    return scores, ids
+    samples = {r: {key: np.full(32, .2 + r * .2) for key in analysis.METRICS} for r in ratios}
+    return samples, ids
 
 
-def test_paired_statistics_slope_ties_and_seed_boundary():
+def test_paired_statistics_and_supervision_trend():
     scores, ids = synthetic_scores()
     report = analysis.summarize(scores, ids, shared.common.SPLITS, boot=40, seed=9)
     metric = report["by_split"]["id"]["metrics"]["cascade_f1"]
     assert metric["trend"]["spearman"] == pytest.approx(1)
     assert metric["trend"]["slope_per_unit_fraction"] == pytest.approx(.2)
-    assert metric["contrasts"]["vs_f0"]["16"]["mean"] == pytest.approx(.05)
-    np.testing.assert_allclose(metric["contrasts"]["vs_f0"]["16"]["ci"], [.05, .05])
+    value = metric["contrasts"]["vs_r000"]["r064"]
+    assert value["mean"] == pytest.approx(.05)
+    np.testing.assert_allclose(value["ci"], [.05, .05])
     assert metric["monotonic_increasing_means"] is True
     assert report["settings"]["seed_std"] is None
+    assert report["settings"]["reuse_main_endpoints"] is False
     assert report == analysis.summarize(scores, ids, shared.common.SPLITS, boot=40, seed=9)
     assert analysis.spearman([0, 1, 2], [2, 2, 2]) is None
-    np.testing.assert_allclose(analysis.average_ranks([3, 1, 1]), [2, .5, .5])
 
 
-def test_missing_dose_empty_groups_and_nonmonotonic_outcome():
+def test_nonmonotonic_and_undefined_rank_outcomes():
     scores, ids = synthetic_scores()
-    scores[16]["cascade_f1"][:] = .9
+    scores[.25]["cascade_f1"][:] = .9
+    scores[.75]["rank_acc"][:] = np.nan
     report = analysis.summarize(scores, ids, shared.common.SPLITS, boot=20)
-    row = report["by_split"]["id"]["metrics"]["cascade_f1"]
-    assert row["descriptive_best_F"] == 16
-    assert row["monotonic_increasing_means"] is False
-    scores[48]["rank_acc"][:] = np.nan
-    report = analysis.summarize(scores, ids, shared.common.SPLITS, boot=20)
+    metric = report["by_split"]["id"]["metrics"]["cascade_f1"]
+    assert metric["descriptive_best_ratio"] == .25
+    assert metric["monotonic_increasing_means"] is False
     assert report["by_split"]["id"]["metrics"]["rank_acc"]["trend"]["n_cases"] == 0
-    scores.pop(8)
-    with pytest.raises(ValueError, match="all selected doses"):
+    scores.pop(.125)
+    with pytest.raises(ValueError, match="all selected ratios"):
         analysis.summarize(scores, ids, shared.common.SPLITS, boot=20)
 
 
-@pytest.mark.parametrize("levels", [shared.LEVELS, (0, 16, 32, 48)])
-def test_report_and_plots_match_actual_levels(tmp_path, levels):
-    scores, ids = synthetic_scores(levels)
-    report = analysis.summarize(scores, ids, shared.common.SPLITS, boot=20, levels=levels)
+@pytest.mark.parametrize("ratios", [shared.RATIOS, (0, .25, .5, .75)])
+def test_report_and_plot_label_supervision_not_frames(tmp_path, ratios):
+    scores, ids = synthetic_scores(ratios)
+    report = analysis.summarize(scores, ids, shared.common.SPLITS, boot=20, ratios=ratios, steps=12000)
     text = analysis.markdown(report)
-    assert ("显式缩减" in text) == (levels != shared.LEVELS)
-    assert ("| F=8 |" in text) == (8 in levels)
+    assert "监督采样比例" in text and "12,000" not in text
+    assert "F=16" not in text and "完整5轮" not in text
+    assert ("12.5%" in text) == (.125 in ratios)
+    assert "50.0% − 0.0%" in text
     analysis.plot(report, tmp_path)
-    assert all((tmp_path / f"dose_response.{suffix}").stat().st_size > 100 for suffix in ("png", "pdf"))
+    assert all((tmp_path / ("dose_response." + suffix)).stat().st_size > 100 for suffix in ("png", "pdf"))
 
 
-def test_analysis_saves_new_reports_without_overwriting(tmp_path, monkeypatch):
-    monkeypatch.setattr(shared.common, "RESULTS_ROOT", tmp_path)
-    scores, ids = synthetic_scores((0, 16, 32, 48))
-    shared.write_json(tmp_path / "bench.json", {"splits": list(shared.common.SPLITS)})
-    audited = {"protocol": {"levels": [0, 16, 32, 48]}, "inputs": {"bench": str(tmp_path / "bench.npz")}, "source": {"frozen": True}}
-    monkeypatch.setattr(analysis, "verify_audit", lambda name: audited)
-    monkeypatch.setattr(analysis, "load_results", lambda *a: (scores, ids, {"0": "source"}, {}))
+def test_repeat_analysis_preserves_previous_report(source, monkeypatch):
+    bundle, out, _ = source
+    audited = audit.audit_sampling(bundle, "unit")
+    scores, ids = synthetic_scores()
+    shared.write_json(bundle["inputs"]["bench"].with_suffix(".json"), {"splits": list(shared.common.SPLITS)})
+    monkeypatch.setattr(analysis, "verify_audit", lambda *a: audited)
+    monkeypatch.setattr(analysis, "load_results", lambda *a: (scores, ids, {"r000": "new_model"}, {}))
     first = analysis.analyze("unit", boot=20)
     before = (first / "formation_ratio.json").read_bytes()
     second = analysis.analyze("unit", boot=20)
-    assert first != second
+    assert first != second and second.is_relative_to(out)
     assert (first / "formation_ratio.json").read_bytes() == before
-    assert second.is_relative_to(shared.run_path("unit"))
 
 
-def test_dry_run_never_creates_or_trains(tmp_path, monkeypatch):
-    monkeypatch.setattr(shared.common, "RESULTS_ROOT", tmp_path)
+def test_analysis_never_reads_old_endpoints(source, monkeypatch):
+    bundle, out, _ = source
+    audited = audit.audit_sampling(bundle, "unit")
+    audited["endpoints"] = {"0": "must_not_read", "32": "must_not_read"}
+    monkeypatch.setattr(analysis.common, "load_bench", lambda *a: {"split_ids": np.zeros(512, int)})
+    seen = []
+
+    def validate(path, row, audited):
+        seen.append(path)
+        raise ValueError("new model missing")
+
+    monkeypatch.setattr(analysis, "validate_done", validate)
+    with pytest.raises(ValueError, match="new model missing"):
+        analysis.load_results("unit", audited)
+    assert seen == [out / "train/r000_seed0"]
+
+
+def test_dry_run_never_creates_outputs_or_trains(source, monkeypatch):
+    bundle, _, _ = source
     monkeypatch.delenv("FW_RUN", raising=False)
-    monkeypatch.setattr(main, "validate_source", lambda source, levels: {"manifest": {"protocol": {"levels": list(levels)}}})
-    monkeypatch.setattr(main, "bind_run", lambda *a: pytest.fail("dry-run must not bind or write"))
-    monkeypatch.setattr(main, "execute_queue", lambda *a: pytest.fail("dry-run must not train"))
-    main.main(["--dry-run", "--levels", "0,16,32,48"])
-    assert not list(tmp_path.iterdir())
+    monkeypatch.setattr(main, "validate_source", lambda value, ratios, steps: bundle)
+    monkeypatch.setattr(main, "bind_run", lambda *a: pytest.fail("dry run should not write"))
+    monkeypatch.setattr(main, "execute_queue", lambda *a: pytest.fail("dry run should not train"))
+    before = sorted(shared.common.RESULTS_ROOT.rglob("*"))
+    main.main(["--dry-run"])
+    assert before == sorted(shared.common.RESULTS_ROOT.rglob("*"))
 
 
-def test_run_lock_rejects_concurrent_pipelines(tmp_path):
-    with main.run_lock(tmp_path):
-        with pytest.raises(ValueError, match="another"):
-            with main.run_lock(tmp_path):
-                pytest.fail("concurrent pipeline acquired same run lock")
+def test_prepare_pipeline_writes_audit_and_jobs_only(source, monkeypatch):
+    bundle, out, _ = source
+    monkeypatch.delenv("FW_RUN", raising=False)
+    monkeypatch.setattr(main, "validate_source", lambda *a: bundle)
+    monkeypatch.setattr(main, "execute_queue", lambda *a: pytest.fail("prepare must not train"))
+    main.main(["--run", "unit", "--stage", "prepare"])
+    assert (out / "audit.json").exists() and (out / "jobs/formation_ratio.json").exists()
+    assert not (out / "cache").exists() and not (out / "data").exists()
 
 
-@pytest.mark.parametrize("cards", ["", "0,0", "0,", "-1", "foo"])
-def test_invalid_devices_are_rejected_before_source_check(cards, monkeypatch):
-    monkeypatch.setattr(run_queue, "verify_audit", lambda *a: pytest.fail("invalid devices should fail first"))
+def test_resume_inherits_ratio_source_and_step_budget(source, monkeypatch):
+    bundle, _, _ = source
+    calls = []
+
+    def validate(value, ratios, steps):
+        calls.append((value, ratios, steps))
+        return bundle
+
+    monkeypatch.setattr(main, "validate_source", validate)
+    main.main(["--run", "unit", "--dry-run"])
+    assert calls == [("source03", shared.RATIOS, 1000)]
+
+
+@pytest.mark.parametrize("args", [["--levels", "0,16,32,48"], ["--workers", "4"], ["--stage", "preflight"]])
+def test_retired_arguments_fail_before_source_loading(monkeypatch, args):
+    monkeypatch.setattr(main, "validate_source", lambda *a: pytest.fail("old CLI should not run"))
+    with pytest.raises(SystemExit):
+        main.main(args)
+
+
+def test_retired_data_generator_cannot_replay_or_write():
+    with pytest.raises(SystemExit, match="retired"):
+        generate_data.main([])
+
+
+@pytest.mark.parametrize("cards", ["", "0,0", "0,", "-1", "not_a_gpu"])
+def test_invalid_devices_fail_before_audit(monkeypatch, cards):
+    monkeypatch.setattr(run_queue, "verify_audit", lambda *a: pytest.fail("should reject cards before audit"))
     with pytest.raises(ValueError):
         run_queue.execute_queue("unit", cards)
 
 
-def test_completed_task_is_reused_without_subprocess(tmp_path, monkeypatch):
-    for name in ("done.json", "eval.json", "eval_samples.npz", "eval_complete.json"):
-        (tmp_path / name).write_text("{}")
-    done = {"ckpt_sha1": "checked"}
-    monkeypatch.setattr(run_queue, "validate_done", lambda *a: done)
-    monkeypatch.setattr(run_queue, "validate_eval", lambda out, audited, value: None if value == done else pytest.fail("wrong checkpoint"))
-    monkeypatch.setattr(run_queue.subprocess, "Popen", lambda *a, **k: pytest.fail("completed task must not launch"))
-    assert run_queue.run_job({"F": 16, "out": str(tmp_path)}, "cpu", {})
+def test_completed_training_and_eval_skip_subprocess(source, monkeypatch):
+    out, row, audited, _, done = completion_record(source)
+    (out / "eval_complete.json").write_text("{}")
+    monkeypatch.setattr(run_queue, "validate_eval", lambda *a: None)
+    monkeypatch.setattr(run_queue.subprocess, "Popen", lambda *a, **k: pytest.fail("completed job must not rerun"))
+    assert run_queue.run_job(row, "cpu", audited)
 
 
-def test_invalid_completed_task_is_not_overwritten(tmp_path, monkeypatch):
-    (tmp_path / "done.json").write_text("{}")
-    monkeypatch.setattr(run_queue, "validate_done", lambda *a: (_ for _ in ()).throw(ValueError("changed checkpoint")))
-    monkeypatch.setattr(run_queue.subprocess, "Popen", lambda *a, **k: pytest.fail("invalid completion must not rerun"))
-    assert not run_queue.run_job({"F": 16, "out": str(tmp_path)}, "cpu", {})
-    assert shared.common.load_json(tmp_path / "failed.json")["error"] == "changed checkpoint"
+def test_invalid_completed_job_records_failure_without_retraining(source, monkeypatch):
+    out, row, audited, _, done = completion_record(source)
+    done["samples_seen"] = 0
+    shared.write_json(out / "done.json", done)
+    monkeypatch.setattr(run_queue.subprocess, "Popen", lambda *a, **k: pytest.fail("invalid completion must not be overwritten"))
+    assert not run_queue.run_job(row, "cpu", audited)
+    assert shared.common.load_json(out / "failed.json")["formation_ratio"] == .25
 
 
-def test_queue_launches_training_then_evaluates_selected_checkpoint(tmp_path, monkeypatch):
-    calls, stages = [], []
-    done = {"ckpt_sha1": "selected"}
+def test_queue_launches_new_trainer_and_existing_evaluator_from_project_root(source, monkeypatch):
+    bundle, out, _ = source
+    audited = audit.audit_sampling(bundle, "unit")
+    row = make_jobs.jobs("unit", audited)[0]
+    calls, checks = [], []
 
     class Process:
         returncode = 0
 
         def __init__(self, command, **kwargs):
             calls.append(command)
+            assert kwargs["cwd"] == shared.PROJECT
             assert kwargs["env"]["CUDA_VISIBLE_DEVICES"] == "2"
 
         def poll(self):
             return 0
 
-    def validate_done(*args):
-        stages.append("train")
-        return done
-
-    def validate_eval(out, audited, value):
-        assert value == done
-        stages.append("eval")
-
     monkeypatch.setattr(run_queue.subprocess, "Popen", Process)
-    monkeypatch.setattr(run_queue, "validate_done", validate_done)
-    monkeypatch.setattr(run_queue, "record_eval", validate_eval)
-    row = {"F": 16, "out": str(tmp_path), "cmd": ["python", "-m", "exp.train"]}
-    assert run_queue.run_job(row, "2", {"inputs": {"bench": str(tmp_path / "bench.npz")}}, interval=.01)
-    assert [command[2] for command in calls] == ["exp.train", "exp.evaluate"]
-    assert stages == ["train", "eval"]
+    monkeypatch.setattr(run_queue, "validate_done", lambda *a: {"ckpt_sha1": "selected"})
+    monkeypatch.setattr(run_queue, "record_eval", lambda *a: checks.append("committed"))
+    assert run_queue.run_job(row, "2", audited, interval=.01)
+    assert [c[2] for c in calls] == ["preresearch.05_formation_ratio.exp.train_ratio", "preresearch.01_pilot_validity.exp.evaluate"]
+    assert checks == ["committed"]
 
 
-def test_source_and_child_symlinks_are_rejected_without_writes(small_source):
-    bundle, out, arrays, actions, formation = small_source
-    data = out / "data"
-    data.mkdir()
-    (data / "f16").symlink_to(bundle["inputs"]["data"], target_is_directory=True)
-    before = {p.name: p.read_bytes() for p in bundle["inputs"]["data"].iterdir()}
-    with pytest.raises(ValueError, match="symbolic link"):
-        gen.create_variant(bundle, out, 16, arrays, actions, formation, workers=1, chunk=2)
-    with pytest.raises(ValueError, match="symbolic link"):
-        shared.bind_run("unit", bundle)
-    assert before == {p.name: p.read_bytes() for p in bundle["inputs"]["data"].iterdir()}
-
-
-def test_interrupted_generation_preserves_shards_and_rejects_changed_shard_size(small_source, monkeypatch):
-    bundle, out, arrays, actions, formation = small_source
-    original = gen._worker
-
-    def fail_later(args):
-        if args[1] == 2:
-            return 2, None, None, "construction failed"
-        return original(args)
-
-    monkeypatch.setattr(gen, "_worker", fail_later)
-    with pytest.raises(ValueError, match="completed shards retained"):
-        gen.create_variant(bundle, out, 16, arrays, actions, formation, workers=1, chunk=2)
-    shard = out / "data/f16/shards/000000_000002/complete.json"
-    before = shard.read_bytes()
-    with pytest.raises(ValueError, match="shard size changed"):
-        gen.create_variant(bundle, out, 16, arrays, actions, formation, workers=1, chunk=1)
-    assert shard.read_bytes() == before
-    monkeypatch.setattr(gen, "_worker", original)
-    gen.create_variant(bundle, out, 16, arrays, actions, formation, workers=1, chunk=2)
-    assert shard.read_bytes() == before
-    assert not (out / "data/f16/blocked.json").exists()
-
-
-def test_resume_inherits_source_and_doses_before_read_only_check(tmp_path, monkeypatch):
-    monkeypatch.setattr(shared.common, "RESULTS_ROOT", tmp_path)
-    manifest = {"source_run": "alternative_source", "protocol": {"levels": [0, 16, 32, 48]}}
-    shared.write_json(shared.run_path("unit") / "source.json", manifest)
+def test_uncommitted_eval_is_repeated_without_retraining(source, monkeypatch):
+    out, row, audited, _, _ = completion_record(source)
+    (out / "eval_samples.npz").write_bytes(b"partial")
     calls = []
-
-    def source(value, levels):
-        calls.append((value, levels))
-        return {"manifest": manifest}
-
-    monkeypatch.setattr(main, "validate_source", source)
-    main.main(["--run", "unit", "--dry-run"])
-    assert calls == [("alternative_source", (0, 16, 32, 48))]
-
-
-@pytest.mark.parametrize("module", [gen, audit, make_jobs, run_queue, analysis])
-def test_all_independent_entrypoints_share_pipeline_lock(tmp_path, monkeypatch, module):
-    monkeypatch.setattr(shared.common, "RESULTS_ROOT", tmp_path)
-    with shared.run_lock(shared.run_path("unit")):
-        with pytest.raises(ValueError, match="another"):
-            module.main(["--run", "unit"])
-
-
-def prediction_fixture():
-    initial = D.terrain()
-    initial[D.FLOOR, 10] = D.STONE
-    background = np.zeros_like(initial)
-    truth = D.terrain()
-    pred_fg = np.stack((truth, truth))[None]
-    pred_bg = np.zeros_like(pred_fg)
-    mask = np.zeros((1, 2, 28, 56), bool)
-    mask[0, :, D.FLOOR, 10] = True
-    scores = [shared.metrics.score_sample((truth, background), (truth, background), (initial, background), mask[0, k]) for k in range(2)]
-    bench = {"split_ids": np.zeros(1, int), "rank_valid": np.array([False]), "cascade": np.array([[0, 0]]),
-             "ctx_fg": initial[None], "ctx_bg": background[None], "fut_fg": pred_fg[:, :, None],
-             "fut_bg": pred_bg[:, :, None], "A": mask, "labels": np.array([[0, 0]])}
-    samples = {key: np.array([[score[key] for score in scores]]) for key in ("cascade_f1", "change_f1", "cell_acc_mask", "any_violation")}
-    samples.update(split_ids=bench["split_ids"], rank_valid=bench["rank_valid"], n_cascade_true=bench["cascade"],
-                   rank_acc=np.array([np.nan]), pred_fg=pred_fg, pred_bg=pred_bg)
-    return samples, bench
-
-
-@pytest.mark.parametrize("key", ["cascade_f1", "change_f1", "cell_acc_mask", "any_violation"])
-def test_all_reported_prediction_metrics_are_recomputed(key):
-    samples, bench = prediction_fixture()
-    shared.validate_metrics(samples, bench)
-    samples[key][0, 0] = 1 - samples[key][0, 0]
-    with pytest.raises(ValueError, match="cached"):
-        shared.validate_metrics(samples, bench)
-
-
-def test_eval_commit_rejects_changed_prediction_bytes(tmp_path, monkeypatch):
-    samples, bench = prediction_fixture()
-    n = 512
-    samples = {k: np.repeat(v, n, axis=0) for k, v in samples.items()}
-    bench = {k: np.repeat(v, n, axis=0) for k, v in bench.items()}
-    shared.write_npz(tmp_path / "bench.npz", {k: v for k, v in bench.items() if k != "A"})
-    event = v3.mk("single", (0, [{"type": "remove", "x": 10, "y": D.FLOOR}]))
-    shared.write_json(tmp_path / "bench.json", {"scene_kinds": ["tower"] * n,
-        "splits": list(shared.common.SPLITS), "interventions": [[event, event] for _ in range(n)]})
-    shared.write_npz(tmp_path / "eval_samples.npz", samples)
-    shared.write_json(tmp_path / "eval.json", {"checked": True})
-    monkeypatch.setattr(shared.main_shared, "validate_evaluation", lambda *a: {"checked": True})
-    done = {"ckpt_sha1": "selected"}
-    audited = {"inputs": {"bench": str(tmp_path / "bench.npz")}}
-    shared.record_eval(tmp_path, audited, done)
-    before = (tmp_path / "eval_complete.json").read_bytes()
-    shared.record_eval(tmp_path, audited, done)
-    assert (tmp_path / "eval_complete.json").read_bytes() == before
-    samples["change_f1"][0, 0] = 0
-    shared.write_npz(tmp_path / "eval_samples.npz", samples)
-    with pytest.raises(ValueError, match="identity changed"):
-        shared.validate_eval(tmp_path, audited, done)
-
-
-def test_uncommitted_eval_restarts_without_retraining(tmp_path, monkeypatch):
-    (tmp_path / "done.json").write_text("{}")
-    (tmp_path / "eval.json").write_text("{}")
-    (tmp_path / "eval_samples.npz").write_bytes(b"truncated")
-    calls = []
-    done = {"ckpt_sha1": "selected"}
 
     class Process:
         returncode = 0
@@ -509,57 +544,97 @@ def test_uncommitted_eval_restarts_without_retraining(tmp_path, monkeypatch):
         def poll(self):
             return 0
 
-    monkeypatch.setattr(run_queue, "validate_done", lambda *a: done)
-    monkeypatch.setattr(run_queue, "record_eval", lambda *a: None)
     monkeypatch.setattr(run_queue.subprocess, "Popen", Process)
-    row = {"F": 16, "out": str(tmp_path), "cmd": ["python", "-m", "exp.train"]}
-    assert run_queue.run_job(row, "cpu", {"inputs": {"bench": str(tmp_path / "bench.npz")}}, interval=.01)
-    assert len(calls) == 1 and calls[0][2] == "exp.evaluate"
+    monkeypatch.setattr(run_queue, "record_eval", lambda *a: None)
+    assert run_queue.run_job(row, "cpu", audited, interval=.01)
+    assert len(calls) == 1 and calls[0][2].endswith("exp.evaluate")
 
 
-@pytest.fixture
-def complete_training(tmp_path):
-    hashes = {name: "frozen" for name in ("train_process.npz", "train_process_actions.json", "train_summary.json")}
-    val_hashes = {name: "validation" for name in ("train_state.npz", "train_state_actions.json", "train_summary.json")}
-    audited = {"protocol": {"levels": [0, 16, 32]}, "inputs": {"val": str(tmp_path / "val")},
-        "hashes": {"val": val_hashes}, "variants": {"16": {"data": str(tmp_path / "data"), "hashes": hashes}}}
+def test_queue_stop_prevents_child_start(source, monkeypatch):
+    bundle, out, _ = source
+    audited = audit.audit_sampling(bundle, "unit")
     row = make_jobs.jobs("unit", audited)[0]
-    args = import_module(f"{shared.PACKAGE}.train").get_args(row["cmd"][3:])
-    config = {"args": {k: shared.common.rel(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-              "data_sha1": hashes, "val_sha1": val_hashes}
-    shared.write_json(tmp_path / "config.json", config)
-    (tmp_path / "ckpt.pt").write_bytes(b"selected EMA")
-    b = shared.budget(16)
-    done = {"steps": b["steps"], "epochs": 5, "steps_per_epoch": b["steps_per_epoch"], "n_pairs": b["pairs"],
-            "samples_seen": b["samples"], "selection": "val_cascade_acc", "best_step": b["steps_per_epoch"],
-            "form_frac_mean": b["formation_fraction"], "ckpt_sha1": shared.common.sha1_file(tmp_path / "ckpt.pt")}
-    shared.write_json(tmp_path / "done.json", done)
-    return tmp_path, row, audited, config, done
+    stopped = Event()
+    stopped.set()
+    monkeypatch.setattr(run_queue.subprocess, "Popen", lambda *a, **k: pytest.fail("cancelled task started"))
+    assert not run_queue.run_job(row, "cpu", audited, stop=stopped)
 
 
-def test_real_training_completion_contract(complete_training):
-    path, row, audited, _, done = complete_training
-    assert shared.validate_done(path, row, audited) == done
-
-
-@pytest.mark.parametrize("field", ["seed", "dim", "samples_seen", "best_step", "form_frac_mean", "data_sha1", "ckpt_sha1"])
-def test_completion_rejects_budget_settings_or_identity_changes(complete_training, field):
-    path, row, audited, config, done = complete_training
-    if field in ("seed", "dim"):
-        config["args"][field] += 1
-    elif field == "data_sha1":
-        config[field] = {}
+@pytest.mark.parametrize("key", ["args", "cfg", "step", "selection", "ema", "unloadable"])
+def test_internal_checkpoint_identity_and_nonfinite_weights_are_rejected(source, key):
+    out, row, audited, cfg, done = completion_record(source)
+    ckpt = torch.load(out / "ckpt.pt", map_location="cpu", weights_only=True)
+    if key == "unloadable":
+        (out / "ckpt.pt").write_bytes(b"not a checkpoint")
     else:
-        done[field] = "changed" if field == "ckpt_sha1" else 1
-    shared.write_json(path / "config.json", config)
-    shared.write_json(path / "done.json", done)
-    with pytest.raises(ValueError):
-        shared.validate_done(path, row, audited)
+        if key == "args":
+            ckpt[key]["formation_ratio"] = .5
+        elif key == "cfg":
+            ckpt[key]["dim"] = 24
+        elif key == "step":
+            ckpt[key] = 1000
+        elif key == "selection":
+            ckpt[key] = "last"
+        else:
+            next(iter(ckpt["ema"].values())).fill_(float("nan"))
+        torch.save(ckpt, out / "ckpt.pt")
+    done["ckpt_sha1"] = shared.common.sha1_file(out / "ckpt.pt")
+    shared.write_json(out / "done.json", done)
+    with pytest.raises(ValueError, match="checkpoint"):
+        shared.validate_done(out, row, audited)
 
 
-def test_sparse_formation_uses_full_construction_time_span():
-    actions = [{"type": "place", "x": i, "y": 0} for i in range(5)]
-    frames = gen.partition_actions(actions, 43)
-    occupied = [i for i, frame in enumerate(frames) if frame]
-    assert occupied[-1] == 42 and occupied[0] > 0
-    assert sum(frames, []) == actions
+def perfect_bench(tmp_path, n=512):
+    initial = D.terrain()
+    initial[D.FLOOR, 10] = D.STONE
+    target = D.terrain()
+    background = np.zeros_like(initial)
+    pred_fg = np.stack((target, target))[None]
+    pred_bg = np.zeros_like(pred_fg)
+    mask = np.zeros((1, 2, 28, 56), bool)
+    mask[0, :, D.FLOOR, 10] = True
+    score = shared.metrics.score_sample((target, background), (target, background), (initial, background), mask[0, 0])
+    bench = {"split_ids": np.zeros(1, int), "rank_valid": np.array([False]), "cascade": np.array([[0, 0]]),
+             "ctx_fg": initial[None], "ctx_bg": background[None], "fut_fg": pred_fg[:, :, None],
+             "fut_bg": pred_bg[:, :, None], "labels": np.array([[0, 0]])}
+    raw = {k: np.array([[score[k], score[k]]]) for k in ("cascade_f1", "change_f1", "cell_acc_mask", "any_violation")}
+    raw.update(split_ids=bench["split_ids"], rank_valid=bench["rank_valid"], n_cascade_true=bench["cascade"],
+        rank_acc=np.array([np.nan]), pred_fg=pred_fg, pred_bg=pred_bg)
+    bench = {k: np.repeat(v, n, axis=0) for k, v in bench.items()}
+    raw = {k: np.repeat(v, n, axis=0) for k, v in raw.items()}
+    shared.write_npz(tmp_path / "bench.npz", bench)
+    event = v3.mk("single", (0, [{"type": "remove", "x": 10, "y": D.FLOOR}]))
+    shared.write_json(tmp_path / "bench.json", {"scene_kinds": ["tower"] * n, "splits": list(shared.common.SPLITS),
+        "interventions": [[event, event] for _ in range(n)]})
+    return raw
+
+
+def test_real_eval_metadata_predictions_and_atomic_commit(source):
+    out, row, audited, cfg, done = completion_record(source)
+    bench = shared.resolve_file(audited["inputs"]["bench"])
+    raw = perfect_bench(bench.parent)
+    audited["hashes"]["bench"] = {p.name: shared.common.sha1_file(p) for p in (bench, bench.with_suffix(".json"))}
+    metadata = {"bench": shared.common.rel(bench), "n_samples": 512,
+        "bench_sha1": audited["hashes"]["bench"][bench.name],
+        "bench_json_sha1": audited["hashes"]["bench"][bench.with_suffix(".json").name],
+        "checkpoint_sha1": done["ckpt_sha1"]}
+    shared.write_json(out / "eval.json", metadata)
+    shared.write_npz(out / "eval_samples.npz", raw)
+    shared.record_eval(out, audited, done)
+    before = (out / "eval_complete.json").read_bytes()
+    shared.record_eval(out, audited, done)
+    assert before == (out / "eval_complete.json").read_bytes()
+    raw["change_f1"][0, 0] = 0
+    shared.write_npz(out / "eval_samples.npz", raw)
+    with pytest.raises(ValueError, match="identity changed"):
+        shared.validate_eval(out, audited, done)
+
+
+@pytest.mark.parametrize("key", ["cascade_f1", "change_f1", "cell_acc_mask", "any_violation"])
+def test_all_reported_metrics_must_match_prediction_states(tmp_path, key):
+    raw = perfect_bench(tmp_path, n=2)
+    bench = shared.common.load_bench(tmp_path / "bench.npz")
+    shared.validate_metrics(raw, bench)
+    raw[key][0, 0] = 1 - raw[key][0, 0]
+    with pytest.raises(ValueError, match="cached"):
+        shared.validate_metrics(raw, bench)

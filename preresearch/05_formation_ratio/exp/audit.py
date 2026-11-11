@@ -1,163 +1,121 @@
-"""Audit dose variants without resampling scenes, repairing data or changing endpoints."""
+"""Read-only population audit; no trajectory generation or frame cache."""
 import argparse
 from collections import Counter
-from contextlib import ExitStack
 import zipfile
 
 import numpy as np
 
-from .generate_data import cache_arrays, read_shard, shard_identity
-from .shared import (EPISODES, VERSION, budget, common, new_levels, resolve_file, run_lock, run_path, verify_manifest,
-                     verify_variant, write_json)
-import datasets_v3 as v3
+from .shared import (VERSION, array_sha1, budget, common, dose_key, resolve_file,
+                     run_lock, run_path, verify_manifest, write_json)
 
 
-def validate_episode(arrays, actions, source_state, source_actions, source_formation_actions, F):
-    n_ops = 64 - F
-    if F not in (8, 16, 48) or len(actions) != 64 or len(source_formation_actions) < 32:
-        raise ValueError("invalid dose or action frame layout")
-    if arrays["fg"].shape != source_state["fg"].shape or arrays["bg"].shape != arrays["fg"].shape:
-        raise ValueError("variant must preserve the 64-frame grid layout")
-    for key in ("fg", "bg", "cont"):
-        if not np.array_equal(arrays[key][F:], source_state[key][:n_ops]):
-            raise ValueError("operation frames must be the exact frozen state prefix")
-    if actions[F:] != source_actions[:n_ops]:
-        raise ValueError("operation actions differ from the same frozen event prefix")
-    expected_phase = np.array([0] * F + [1] * n_ops, dtype=arrays["phase"].dtype)
+def array_header(archive, key):
+    with archive.open(key + ".npy") as reader:
+        version = np.lib.format.read_magic(reader)
+        if version == (1, 0):
+            shape, fortran, dtype = np.lib.format.read_array_header_1_0(reader)
+        elif version == (2, 0):
+            shape, fortran, dtype = np.lib.format.read_array_header_2_0(reader)
+        else:
+            raise ValueError("unsupported source NPY version")
+    if dtype.hasobject or fortran:
+        raise ValueError("source arrays must be non-object C-order arrays")
+    return shape, dtype
+
+
+def population(data, episodes):
+    data = resolve_file(data)
+    summary = common.load_summary(data)
+    if summary["layout"]["formation"] != 32 or summary["layout"]["clip"] != 8:
+        raise ValueError("supervision sampling requires the unchanged F32 source layout")
+    if summary["conditions"]["process"]["episodes"] != episodes:
+        raise ValueError("source must contain the full frozen episode population")
+    with zipfile.ZipFile(data / "train_process.npz") as archive:
+        for key in ("fg", "bg", "cont", "phase"):
+            shape, dtype = array_header(archive, key)
+            expected = (episodes, 64, common.H, common.W) if key in ("fg", "bg") else (episodes, 64)
+            allowed = {"fg": ("uint8",), "bg": ("uint8",), "phase": ("int8", "uint8"), "cont": ("bool",)}
+            if shape != expected or dtype.name not in allowed[key]:
+                raise ValueError(f"source {key} array layout changed: {shape}, {dtype}")
+    with np.load(data / "train_process.npz", allow_pickle=False) as z:
+        phase, cont = z["phase"], z["cont"]
+    expected_phase = np.array([0] * 32 + [1] * 32, dtype=np.uint8)
     expected_cont = np.ones(64, bool)
-    expected_cont[0] = False
-    expected_cont[F::8] = False
-    if not np.array_equal(arrays["phase"], expected_phase) or not np.array_equal(arrays["cont"], expected_cont):
-        raise ValueError("incorrect formation labels or reset boundaries")
-    if actions[0] or any(actions[t] for t in range(F - 4, F)):
-        raise ValueError("initial and final four settling frames must have empty actions")
-    canonical = lambda a: tuple(sorted(v3.to_action(a).as_dict().items()))
-    if [canonical(a) for frame in actions[:F] for a in frame] != [canonical(a) for frame in source_formation_actions[:32] for a in frame]:
-        raise ValueError("compressed formation must preserve all original actions in order")
-    if (not np.array_equal(arrays["fg"][F - 1], source_state["fg"][0])
-            or not np.array_equal(arrays["bg"][F - 1], source_state["bg"][0])):
-        raise ValueError("variant final structure differs from the frozen scene")
-    for frame in actions[:F]:
-        cells = [(a["x"], a["y"]) for a in frame]
-        if len(cells) != len(set(cells)):
-            raise ValueError("a training action map cannot encode repeated same-cell actions")
+    expected_cont[[0, 32, 40, 48, 56]] = False
+    if not np.all(phase == expected_phase) or not np.all(cont == expected_cont):
+        raise ValueError("source phase labels or reset boundaries changed")
+    pairs = common.make_pairs(data, "process", "video", episodes)
+    mask = phase[pairs[:, 0], pairs[:, 1]] == 0
+    if mask.sum() != episodes * 31 or (~mask).sum() != episodes * 28:
+        raise ValueError("incorrect unchanged formation/operation pool sizes")
+    pools = {"total": len(pairs), "formation": int(mask.sum()), "operation": int((~mask).sum()),
+             "pairs_sha1": array_sha1(pairs), "formation_indices_sha1": array_sha1(np.flatnonzero(mask)),
+             "operation_indices_sha1": array_sha1(np.flatnonzero(~mask)),
+             "natural_formation_share": 31 / 59, "formation_pairs_per_episode": 31,
+             "operation_pairs_per_episode": 28, "operation_clips": 4}
+    scenes = common.load_json(data / "train_scenes.json")
+    payload = common.load_json(data / "train_process_actions.json")
+    actions = payload["actions"]
+    if len(scenes) != episodes or len(actions) != episodes:
+        raise ValueError("incomplete scene/action population")
+    if payload.get("scenes") != [row["kind"] for row in scenes]:
+        raise ValueError("source scene/action order differs")
+    counts = {"formation": Counter(), "operation": Counter()}
+    collisions, examples = 0, []
+    for i, episode in enumerate(actions):
+        if len(episode) != 64:
+            raise ValueError("source action episode has incorrect frame count")
+        for t, frame in enumerate(episode):
+            cells = []
+            for a in frame:
+                if (a["type"] not in common.TYPE_IDX or not 0 <= int(a["x"]) < common.W
+                        or not 0 <= int(a["y"]) < common.H or a.get("layer", "front") not in ("front", "back")):
+                    raise ValueError("source contains actions not representable by the frozen model")
+                cells.append((int(a["x"]), int(a["y"])))
+            counts["formation" if t < 32 else "operation"].update(a["type"] for a in frame)
+            if len(cells) != len(set(cells)):
+                collisions += 1
+                if len(examples) < 8:
+                    examples.append({"episode": i, "frame": t})
+    return {"pools": pools,
+            "scene_distribution": {"scene_types": dict(Counter(row["kind"] for row in scenes)),
+                                   "component_counts": dict(Counter(str(row["n_struct"]) for row in scenes))},
+            "action_types": {k: dict(v) for k, v in counts.items()},
+            "inherited_action_encoding": {"collision_frames": collisions, "examples": examples,
+                "note": "existing single-token encoding is unchanged; duplicate same-cell actions use the last token; no new merging, filtering or replay"}}
 
 
-def open_array_stream(archive, stack, key, reference):
-    reader = stack.enter_context(archive.open(f"{key}.npy"))
-    version = np.lib.format.read_magic(reader)
-    if version == (1, 0):
-        shape, fortran, dtype = np.lib.format.read_array_header_1_0(reader)
-    elif version == (2, 0):
-        shape, fortran, dtype = np.lib.format.read_array_header_2_0(reader)
-    else:
-        raise ValueError("unsupported NPY array version")
-    if fortran or dtype.hasobject or shape != reference.shape or dtype != reference.dtype:
-        raise ValueError("assembled variant has incorrect array layout or dtype")
-    return reader
-
-
-def compare_array_batch(reader, saved):
-    payload = reader.read(saved.nbytes)
-    if len(payload) != saved.nbytes:
-        raise ValueError("assembled variant is truncated")
-    actual = np.frombuffer(payload, dtype=saved.dtype).reshape(saved.shape)
-    if not np.array_equal(actual, saved):
-        raise ValueError("assembled variant arrays differ from saved episode shards")
-
-
-def audit_variants(bundle, name):
+def audit_sampling(bundle, name):
     out = run_path(name)
-    markers = {str(F): verify_variant(out / "data" / f"f{F}", bundle["manifest"], F) for F in new_levels(bundle["manifest"])}
-    arrays, source_actions, formation_actions = cache_arrays(bundle, out)
-    scenes = common.load_json(bundle["inputs"]["data"] / "train_scenes.json")
-    if len(scenes) != EPISODES:
-        raise ValueError("source scene metadata is incomplete")
-    scene_distribution = {"scene_types": dict(Counter(row["kind"] for row in scenes)),
-                          "component_counts": dict(Counter(str(row["n_struct"]) for row in scenes))}
-    report = {"version": VERSION, "source": bundle["manifest"], "inputs": bundle["audited"]["inputs"],
-              "hashes": bundle["audited"]["hashes"], "protocol": bundle["manifest"]["protocol"],
-              "endpoints": bundle["manifest"]["endpoints"], "variants": {},
-              "levels": {str(F): budget(F) for F in bundle["manifest"]["protocol"]["levels"]},
-              "scene_distribution": scene_distribution,
-              "note": "same complete frozen structures and action order; formation timing and operation budget differ"}
-    for F in new_levels(bundle["manifest"]):
-        target = out / "data" / f"f{F}"
-        summary = common.load_json(target / "train_summary.json")
-        if summary["layout"] != {"formation": F, "clip": 8, "state_clips": 8, "mixed_clips": (64 - F) // 8}:
-            raise ValueError("variant summary has incorrect frame boundaries")
-        condition = summary.get("conditions", {}).get("process", {})
-        expected = {"episodes": EPISODES, "frames_per_episode": 64, "total_frames": EPISODES * 64,
-                    "continuous_transitions": budget(F)["pairs"], "formation_frames": EPISODES * F,
-                    "fg_shape": list(arrays["fg"].shape)}
-        if any(condition.get(k) != value for k, value in expected.items()):
-            raise ValueError("variant summary has incorrect episode or transition budget")
-        counts = Counter()
-        final_content = common.load_json(target / "train_process_actions.json")
-        if final_content.get("scenes") != [row["kind"] for row in scenes]:
-            raise ValueError("assembled scene metadata differs from the frozen scene order")
-        final_actions = final_content["actions"]
-        if len(final_actions) != EPISODES:
-            raise ValueError("assembled variant has incorrect action episode count")
-        offset = 0
-        print(f"[05] auditing F={F}: complete script, matched final and nested operations", flush=True)
-        with ExitStack() as stack:
-            archive = stack.enter_context(zipfile.ZipFile(target / "train_process.npz"))
-            readers = {k: open_array_stream(archive, stack, k, arrays[k]) for k in arrays}
-            progress = stack.enter_context(v3.GenerationProgress(f"05 audit F={F}", EPISODES, "episodes"))
-            for directory in sorted((target / "shards").iterdir()):
-                saved = common.load_json(directory / "complete.json")
-                start, end = saved["identity"]["start"], saved["identity"]["end"]
-                read_shard(directory, shard_identity(bundle, F, start, end))
-                if start != offset or not start < end <= EPISODES:
-                    raise ValueError("shards must cover every source episode once in order")
-                with np.load(directory / "episodes.npz", allow_pickle=False) as shard:
-                    batch = {k: shard[k] for k in arrays}
-                actions = common.load_json(directory / "actions.json")["actions"]
-                if len(actions) != end - start:
-                    raise ValueError("shard action count differs from its episode range")
-                for k in arrays:
-                    if batch[k].shape != (end - start,) + arrays[k].shape[1:] or batch[k].dtype != arrays[k].dtype:
-                        raise ValueError("shard array has incorrect layout")
-                    compare_array_batch(readers[k], batch[k])
-                for j, i in enumerate(range(start, end)):
-                    validate_episode({k: batch[k][j] for k in arrays}, actions[j],
-                                     {k: arrays[k][i] for k in arrays}, source_actions[i], formation_actions[i], F)
-                    if final_actions[i] != actions[j]:
-                        raise ValueError("assembled actions differ from saved episode shards")
-                    counts.update(a["type"] for frame in actions[j] for a in frame)
-                offset = end
-                progress.advance(end - start)
-            if offset != EPISODES or any(reader.read(1) for reader in readers.values()):
-                raise ValueError("some frozen episodes were excluded or extra array data was added")
-        report["variants"][str(F)] = {"data": common.rel(target), "hashes": markers[str(F)]["hashes"],
-                                       "operation_prefix_clips": (64 - F) // 8,
-                                       "episodes": EPISODES, "scene_distribution": scene_distribution,
-                                       "action_types": dict(counts), "stats": markers[str(F)]["stats"]}
+    details = population(bundle["inputs"]["data"], bundle["manifest"]["protocol"]["episodes"])
+    report = {"version": VERSION, "source": bundle["manifest"], "protocol": bundle["manifest"]["protocol"],
+              "inputs": bundle["manifest"]["inputs"], "hashes": bundle["manifest"]["hashes"], **details,
+              "budgets": {dose_key(r): budget(r, bundle["manifest"]["protocol"]["steps"])
+                          for r in bundle["manifest"]["protocol"]["ratios"]},
+              "note": "identical original process pairs for every dose; only replacement sampling mixture changes; all doses newly trained"}
     path = out / "audit.json"
     if path.exists() and common.load_json(path) != report:
-        raise ValueError("existing audit differs; use a new run")
+        raise ValueError("existing supervision audit changed; use a new run")
     if not path.exists():
         write_json(path, report)
+    print(f"[05] audited {details['pools']['total']} original pairs; no frame cache or variants generated", flush=True)
     return report
 
 
 def verify_audit(name):
     bundle = verify_manifest(name)
     audited = common.load_json(run_path(name) / "audit.json")
-    expected = {"source": bundle["manifest"], "protocol": bundle["manifest"]["protocol"],
-                "inputs": bundle["audited"]["inputs"], "hashes": bundle["audited"]["hashes"],
-                "endpoints": bundle["manifest"]["endpoints"], "version": VERSION,
-                "levels": {str(F): budget(F) for F in bundle["manifest"]["protocol"]["levels"]}}
-    if any(audited.get(k) != value for k, value in expected.items()):
-        raise ValueError("audited source or protocol changed")
-    for F in new_levels(bundle["manifest"]):
-        data = resolve_file(audited["variants"][str(F)]["data"])
-        if data.resolve() != (run_path(name) / "data" / f"f{F}").resolve():
-            raise ValueError("variant path is outside its bound run")
-        marker = verify_variant(data, bundle["manifest"], F)
-        if marker["hashes"] != audited["variants"][str(F)]["hashes"]:
-            raise ValueError("variant data differs from audit")
+    expected = {"version": VERSION, "source": bundle["manifest"], "protocol": bundle["manifest"]["protocol"],
+                "inputs": bundle["manifest"]["inputs"], "hashes": bundle["manifest"]["hashes"]}
+    if any(audited.get(k) != v for k, v in expected.items()):
+        raise ValueError("audited source or supervision protocol changed")
+    expected_pools = {"total": 59 * audited["protocol"]["episodes"],
+                      "formation": 31 * audited["protocol"]["episodes"],
+                      "operation": 28 * audited["protocol"]["episodes"]}
+    if any(audited.get("pools", {}).get(k) != v for k, v in expected_pools.items()):
+        raise ValueError("audited pair population is incomplete")
+    if audited.get("budgets") != {dose_key(r): budget(r, audited["protocol"]["steps"]) for r in audited["protocol"]["ratios"]}:
+        raise ValueError("audited supervision exposure budget changed")
     return audited
 
 
@@ -166,7 +124,7 @@ def main(argv=None):
     ap.add_argument("--run", required=True)
     a = ap.parse_args(argv)
     with run_lock(run_path(a.run)):
-        audit_variants(verify_manifest(a.run), a.run)
+        audit_sampling(verify_manifest(a.run), a.run)
 
 
 if __name__ == "__main__":

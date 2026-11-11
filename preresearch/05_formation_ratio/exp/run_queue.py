@@ -15,7 +15,7 @@ import zipfile
 
 def run_job(row, card, audited, interval=30, stop=None):
     stop = stop if stop is not None else Event()
-    out = check_output_tree(common.resolve_out(row["out"]))
+    out = check_output_tree(resolve_file(row["out"]))
     out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="" if card == "cpu" else card,
                PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1")
@@ -23,27 +23,27 @@ def run_job(row, card, audited, interval=30, stop=None):
         stages, done = [], None
         if (out / "done.json").exists():
             done = validate_done(out, row, audited)
-            print(f"[05] F={row['F']}: reuse completed training", flush=True)
+            print(f"[05] ratio={row['formation_ratio']:.1%}: reuse completed training", flush=True)
         else:
             if (out / "eval.json").exists() or (out / "eval_samples.npz").exists():
                 raise ValueError("evaluation without completed training")
             if (out / "config.json").exists():
                 validate_config(out, row, audited)
-                print(f"[05] F={row['F']}: interrupted training restarts from step 0; no optimizer resume", flush=True)
+                print(f"[05] ratio={row['formation_ratio']:.1%}: interrupted training restarts from step 0; no optimizer resume", flush=True)
             stages.append(("train", [sys.executable, *row["cmd"][1:]]))
         if (out / "eval_complete.json").exists():
             validate_eval(out, audited, done)
         else:
             if (out / "eval.json").exists() or (out / "eval_samples.npz").exists():
-                print(f"[05] F={row['F']}: uncommitted evaluation restarts; completed training is retained", flush=True)
-            stages.append(("eval", [sys.executable, "-m", "exp.evaluate", "--run", str(out),
+                print(f"[05] ratio={row['formation_ratio']:.1%}: uncommitted evaluation restarts; completed training is retained", flush=True)
+            stages.append(("eval", [sys.executable, "-m", "preresearch.01_pilot_validity.exp.evaluate", "--run", str(out),
                                     "--bench", str(resolve_file(audited["inputs"]["bench"])), "--splits", "all"]))
         for stage, command in stages:
             if stop.is_set():
                 raise RuntimeError("queue interrupted before starting task")
-            print(f"[05] F={row['F']} {stage} on GPU {card}; log={common.rel(out / (stage + '.log'))}", flush=True)
+            print(f"[05] ratio={row['formation_ratio']:.1%} {stage} on GPU {card}; log={common.rel(out / (stage + '.log'))}", flush=True)
             with (out / f"{stage}.log").open("w") as log:
-                process = subprocess.Popen(command, cwd=PROJECT / "preresearch/01_pilot_validity", env=env,
+                process = subprocess.Popen(command, cwd=PROJECT, env=env,
                                            stdout=log, stderr=subprocess.STDOUT)
                 try:
                     last = ""
@@ -55,7 +55,7 @@ def run_job(row, card, audited, interval=30, stop=None):
                             records = reader.read().decode("utf-8", errors="replace").splitlines()
                         latest = next((line for line in reversed(records) if "[train]" in line or "[val]" in line or "[eval]" in line), "loading/checking data")
                         if latest != last:
-                            print(f"[05] F={row['F']} GPU {card}: {latest}", flush=True)
+                            print(f"[05] ratio={row['formation_ratio']:.1%} GPU {card}: {latest}", flush=True)
                             last = latest
                 finally:
                     if process.poll() is None:
@@ -72,11 +72,11 @@ def run_job(row, card, audited, interval=30, stop=None):
             else:
                 record_eval(out, audited, done)
         (out / "failed.json").unlink(missing_ok=True)
-        print(f"[05] F={row['F']}: training and evaluation complete", flush=True)
+        print(f"[05] ratio={row['formation_ratio']:.1%}: training and evaluation complete", flush=True)
         return True
     except (ValueError, KeyError, OSError, RuntimeError, zipfile.BadZipFile) as exc:
-        write_json(out / "failed.json", {"F": row["F"], "error": str(exc)})
-        print(f"[05] F={row['F']}: FAILED: {exc}", flush=True)
+        write_json(out / "failed.json", {"formation_ratio": row["formation_ratio"], "error": str(exc)})
+        print(f"[05] ratio={row['formation_ratio']:.1%}: FAILED: {exc}", flush=True)
         return False
 
 
