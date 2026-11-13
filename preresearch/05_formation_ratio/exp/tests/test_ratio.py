@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from exp import analysis, audit, generate_data, main, make_jobs, run_queue, shared, train_ratio as trainer
+from exp import analysis, audit, evaluate_final, generate_data, main, make_jobs, run_queue, shared, train_ratio as trainer
 import datasets as D
 import datasets_v3 as v3
 
@@ -61,7 +61,7 @@ def source(tmp_path, monkeypatch):
     inputs = {"data": str(data), "val": str(data), "bench": str(tmp_path / "bench.npz")}
     hashes = {"data": {f.name: shared.common.sha1_file(f) for f in data.iterdir()},
               "val": shared.common.data_hashes(data, "state"), "bench": {}}
-    manifest = {"version": 2, "source_run": "source03", "inputs": inputs, "hashes": hashes,
+    manifest = {"version": shared.VERSION, "source_run": "source03", "inputs": inputs, "hashes": hashes,
                 "source_audit_sha1": "frozen", "protocol": p}
     bundle = {"source": tmp_path / "source03", "manifest": manifest,
               "inputs": {k: Path(v) for k, v in inputs.items()}, "audited": {"inputs": inputs, "hashes": hashes}}
@@ -80,8 +80,8 @@ def test_equal_update_budget_and_exact_exposure(ratio, n):
     assert b["epochs"] is None
 
 
-@pytest.mark.parametrize("value", [-1, 1.1, .1, np.nan, np.inf])
-def test_invalid_or_nonintegral_ratios_are_rejected(value):
+@pytest.mark.parametrize("value", [-1, 1.1, np.nan, np.inf])
+def test_invalid_ratios_are_rejected(value):
     with pytest.raises(ValueError):
         shared.formation_count(value)
 
@@ -201,12 +201,12 @@ def test_pool_fingerprints_match_actual_training_data(source):
         trainer.verify_pools(data, pools, broken)
 
 
-def test_all_five_jobs_are_new_and_use_the_same_original_pools(source):
+def test_all_eleven_jobs_are_new_and_use_the_same_original_pools(source):
     bundle, out, _ = source
     audited = audit.audit_sampling(bundle, "unit")
     rows = make_jobs.save_jobs("unit", audited)
     assert [r["formation_ratio"] for r in rows] == list(shared.RATIOS)
-    assert len({r["out"] for r in rows}) == 5
+    assert len({r["out"] for r in rows}) == 11
     for row in rows:
         assert row["cmd"][2] == "preresearch.05_formation_ratio.exp.train_ratio"
         assert row["cwd"] == str(shared.PROJECT)
@@ -258,24 +258,25 @@ def test_shared_run_lock_blocks_other_entrypoints(source, monkeypatch):
                 module.main(["--run", "unit"])
 
 
-def completion_record(source, ratio=.25):
+def completion_record(source, ratio=.2):
     bundle, _, _ = source
     audited = audit.audit_sampling(bundle, "unit")
     row = next(row for row in make_jobs.jobs("unit", audited) if row["formation_ratio"] == ratio)
     out = shared.resolve_file(row["out"])
     out.mkdir(parents=True)
-    cfg = {"version": 2, "args": shared.training_args("unit", ratio, audited), "pools": audited["pools"],
+    cfg = {"version": shared.VERSION, "args": shared.training_args("unit", ratio, audited), "pools": audited["pools"],
            "data_sha1": shared.expected_data_hashes(audited, "data"), "val_sha1": shared.expected_data_hashes(audited, "val")}
     shared.write_json(out / "config.json", cfg)
     model = trainer.models.build_model({k: cfg["args"][k] for k in ("dim", "depth", "heads")})
     torch.save({"model": model.state_dict(), "ema": model.state_dict(), "cfg": model.cfg,
-        "step": 500, "selection": "val_cascade_acc", "args": cfg["args"]}, out / "ckpt.pt")
+        "step": 1000, "selection": "last", "weights": "ema", "args": cfg["args"]}, out / "ckpt.pt")
     b = shared.budget(ratio, 1000)
-    done = {"version": 2, "sampling_mode": shared.MODE, "steps": 1000, "epochs": None, "steps_per_epoch": None,
+    done = {"version": shared.VERSION, "sampling_mode": shared.MODE, "steps": 1000, "epochs": None, "steps_per_epoch": None,
             "samples_seen": b["samples"], "formation_samples_seen": b["formation_samples"],
             "operation_samples_seen": b["operation_samples"], "formation_ratio": ratio, "form_frac_mean": ratio,
-            "n_pairs": audited["pools"]["total"], "selection": "val_cascade_acc", "best_step": 500,
-            "best_val": {"cascade_acc": .7}, "ckpt_sha1": shared.common.sha1_file(out / "ckpt.pt")}
+            "n_pairs": audited["pools"]["total"], "selection": "last", "checkpoint_step": 1000, "weights": "ema",
+            "best_step": 500, "best_val": {"cascade_acc": .7}, "val": {"cascade_acc": .6},
+            "ckpt_sha1": shared.common.sha1_file(out / "ckpt.pt")}
     shared.write_json(out / "done.json", done)
     return out, row, audited, cfg, done
 
@@ -314,7 +315,7 @@ def tiny_fit(source, monkeypatch, ratio=.5):
     monkeypatch.setattr(trainer.models, "build_model", lambda cfg: original_model({**cfg, "emb": 4}))
     target = out / "tiny"
     target.mkdir()
-    config = {"version": 2, "pools": population["pools"], "args": vars(args)}
+    config = {"version": shared.VERSION, "pools": population["pools"], "args": vars(args)}
     done = trainer.fit(data, val, args, target, config)
     return target, done, args
 
@@ -327,21 +328,23 @@ def test_actual_cpu_training_ema_and_sample_counts(source, monkeypatch, ratio):
     assert done["operation_samples_seen"] == 24 * (1 - ratio)
     assert done["epochs"] is None
     checkpoint = torch.load(out / "ckpt.pt", map_location="cpu", weights_only=False)
-    assert checkpoint["step"] == done["best_step"]
-    assert checkpoint["selection"] == "val_cascade_acc"
+    assert checkpoint["step"] == done["checkpoint_step"] == args.steps
+    assert checkpoint["selection"] == "last" and checkpoint["weights"] == "ema"
     assert all(torch.isfinite(v).all() for v in checkpoint["ema"].values())
     logs = [json.loads(line) for line in (out / "train_log.jsonl").read_text().splitlines()]
     assert len([r for r in logs if r.get("type") == "val"]) == 3
     assert all(r["form_frac"] == ratio for r in logs if "form_frac" in r)
 
 
-def test_ties_select_earliest_ema_and_checkpoint_loads_in_existing_evaluator(source, monkeypatch):
+def test_validation_ties_do_not_select_early_ema_and_evaluator_loads_final(source, monkeypatch):
     monkeypatch.setattr(trainer.pilot, "transition_accuracy", lambda *a: {"cascade_acc": .5, "chg_acc": .5, "n_cascade": 2})
     out, done, _ = tiny_fit(source, monkeypatch)
     assert done["best_step"] == 1
     evaluator = import_module(f"{shared.PACKAGE}.evaluate")
     model, checkpoint = evaluator.load_run(out, "cpu")
-    assert checkpoint["step"] == done["best_step"]
+    assert checkpoint["step"] == done["checkpoint_step"] == 3
+    assert checkpoint["step"] != done["best_step"]
+    assert checkpoint["selection"] == "last" and checkpoint["weights"] == "ema"
     assert model.cfg["dim"] == 12 and model.cfg["emb"] == 4
     initial = torch.zeros((1, 28, 56), dtype=torch.long)
     fg, bg = model.step(initial, initial, initial)
@@ -367,9 +370,9 @@ def test_paired_statistics_and_supervision_trend():
     metric = report["by_split"]["id"]["metrics"]["cascade_f1"]
     assert metric["trend"]["spearman"] == pytest.approx(1)
     assert metric["trend"]["slope_per_unit_fraction"] == pytest.approx(.2)
-    value = metric["contrasts"]["vs_r000"]["r064"]
-    assert value["mean"] == pytest.approx(.05)
-    np.testing.assert_allclose(value["ci"], [.05, .05])
+    value = metric["contrasts"][f"vs_{shared.dose_key(0)}"][shared.dose_key(.2)]
+    assert value["mean"] == pytest.approx(.04)
+    np.testing.assert_allclose(value["ci"], [.04, .04])
     assert metric["monotonic_increasing_means"] is True
     assert report["settings"]["seed_std"] is None
     assert report["settings"]["reuse_main_endpoints"] is False
@@ -379,14 +382,14 @@ def test_paired_statistics_and_supervision_trend():
 
 def test_nonmonotonic_and_undefined_rank_outcomes():
     scores, ids = synthetic_scores()
-    scores[.25]["cascade_f1"][:] = .9
-    scores[.75]["rank_acc"][:] = np.nan
+    scores[.2]["cascade_f1"][:] = .9
+    scores[.8]["rank_acc"][:] = np.nan
     report = analysis.summarize(scores, ids, shared.common.SPLITS, boot=20)
     metric = report["by_split"]["id"]["metrics"]["cascade_f1"]
-    assert metric["descriptive_best_ratio"] == .25
+    assert metric["descriptive_best_ratio"] == .2
     assert metric["monotonic_increasing_means"] is False
     assert report["by_split"]["id"]["metrics"]["rank_acc"]["trend"]["n_cases"] == 0
-    scores.pop(.125)
+    scores.pop(.1)
     with pytest.raises(ValueError, match="all selected ratios"):
         analysis.summarize(scores, ids, shared.common.SPLITS, boot=20)
 
@@ -502,7 +505,7 @@ def test_invalid_completed_job_records_failure_without_retraining(source, monkey
     shared.write_json(out / "done.json", done)
     monkeypatch.setattr(run_queue.subprocess, "Popen", lambda *a, **k: pytest.fail("invalid completion must not be overwritten"))
     assert not run_queue.run_job(row, "cpu", audited)
-    assert shared.common.load_json(out / "failed.json")["formation_ratio"] == .25
+    assert shared.common.load_json(out / "failed.json")["formation_ratio"] == .2
 
 
 def test_queue_launches_new_trainer_and_existing_evaluator_from_project_root(source, monkeypatch):
@@ -572,9 +575,9 @@ def test_internal_checkpoint_identity_and_nonfinite_weights_are_rejected(source,
         elif key == "cfg":
             ckpt[key]["dim"] = 24
         elif key == "step":
-            ckpt[key] = 1000
+            ckpt[key] = 500
         elif key == "selection":
-            ckpt[key] = "last"
+            ckpt[key] = "val_cascade_acc"
         else:
             next(iter(ckpt["ema"].values())).fill_(float("nan"))
         torch.save(ckpt, out / "ckpt.pt")
@@ -638,3 +641,188 @@ def test_all_reported_metrics_must_match_prediction_states(tmp_path, key):
     raw[key][0, 0] = 1 - raw[key][0, 0]
     with pytest.raises(ValueError, match="cached"):
         shared.validate_metrics(raw, bench)
+
+
+def test_old_validation_best_run_is_rejected_without_any_writes(source, monkeypatch):
+    bundle, out, _ = source
+    old = deepcopy(bundle["manifest"])
+    old["version"] = 2
+    old["protocol"].pop("checkpoint_selection")
+    old["protocol"].pop("checkpoint_weights")
+    shared.write_json(out / "source.json", old)
+    before = {p: p.read_bytes() for p in out.rglob("*") if p.is_file()}
+    monkeypatch.setattr(evaluate_final, "execute_queue", lambda *a, **k: pytest.fail("old run must not launch inference or training"))
+    with pytest.raises(SystemExit) as exc:
+        evaluate_final.cli(["--run", "unit"])
+    assert exc.value.code == 2
+    assert before == {p: p.read_bytes() for p in out.rglob("*") if p.is_file()}
+
+
+def test_final_eval_preflights_all_checkpoints_before_any_inference(source, monkeypatch):
+    bundle, out, _ = source
+    audited = audit.audit_sampling(bundle, "unit")
+    monkeypatch.setattr(evaluate_final, "verify_audit", lambda *a: audited)
+    checked = []
+
+    def validate(path, row, audited):
+        checked.append(row["formation_ratio"])
+        if row["formation_ratio"] == .2:
+            raise ValueError("final checkpoint missing")
+        return {"checkpoint_step": 1000}
+
+    monkeypatch.setattr(evaluate_final, "validate_done", validate)
+    monkeypatch.setattr(evaluate_final, "execute_queue", lambda *a, **k: pytest.fail("must not partially evaluate a run missing final weights"))
+    with pytest.raises(ValueError, match="final checkpoint missing"):
+        evaluate_final.main(["--run", "unit"])
+    assert checked == [0, .1, .2]
+    assert not (out / "pipeline.lock").exists()
+
+
+def test_final_eval_dry_run_writes_nothing(source, monkeypatch):
+    bundle, out, _ = source
+    audited = audit.audit_sampling(bundle, "unit")
+    monkeypatch.setattr(evaluate_final, "verify_audit", lambda *a: audited)
+    monkeypatch.setattr(evaluate_final, "validate_done", lambda *a: {"checkpoint_step": 1000})
+    monkeypatch.setattr(evaluate_final, "execute_queue", lambda *a, **k: pytest.fail("dry run must not infer or train"))
+    before = sorted(out.rglob("*"))
+    evaluate_final.main(["--run", "unit", "--dry-run"])
+    assert before == sorted(out.rglob("*"))
+
+
+def test_final_eval_calls_evaluation_only_queue_then_analysis(source, monkeypatch):
+    bundle, out, _ = source
+    audited = audit.audit_sampling(bundle, "unit")
+    monkeypatch.setattr(evaluate_final, "verify_audit", lambda *a: audited)
+    monkeypatch.setattr(evaluate_final, "validate_done", lambda *a: {"checkpoint_step": 1000})
+    calls = []
+
+    def queue(name, cards, interval, evaluate_only=False):
+        assert evaluate_only is True
+        calls.append((name, cards, "eval_only"))
+
+    monkeypatch.setattr(evaluate_final, "execute_queue", queue)
+    monkeypatch.setattr(evaluate_final, "analyze", lambda *a: calls.append("analysis"))
+    evaluate_final.main(["--run", "unit", "--gpus", "2,3"])
+    assert calls == [("unit", "2,3", "eval_only"), "analysis"]
+
+
+def test_evaluation_only_task_with_missing_training_never_starts_training(source, monkeypatch):
+    bundle, out, _ = source
+    audited = audit.audit_sampling(bundle, "unit")
+    row = make_jobs.jobs("unit", audited)[0]
+    monkeypatch.setattr(run_queue.subprocess, "Popen", lambda *a, **k: pytest.fail("eval-only must not start any training"))
+    with pytest.raises(FileNotFoundError):
+        run_queue.run_job(row, "cpu", audited, evaluate_only=True)
+    assert not shared.resolve_file(row["out"]).exists()
+
+
+@pytest.mark.parametrize("ratio", shared.RATIOS)
+def test_decile_cumulative_quota_and_full_budget_are_exact(ratio):
+    from fractions import Fraction
+    fraction = Fraction(str(ratio))
+    counts = [shared.formation_count(ratio, step=s) for s in range(1, shared.STEPS + 1)]
+    budget = shared.budget(ratio)
+    assert sum(counts) == shared.STEPS * shared.BATCH * fraction
+    assert sum(counts) == budget["formation_samples"]
+    assert budget["formation_samples"] + budget["operation_samples"] == budget["samples"]
+    assert all(0 <= n <= shared.BATCH for n in counts)
+    assert max(counts) - min(counts) <= 1
+    assert shared.cumulative_formation(ratio, 256, 0) == 0
+
+
+@pytest.mark.parametrize("ratio", shared.RATIOS)
+def test_decile_sampler_preserves_exact_cumulative_counts(ratio):
+    pools = (torch.arange(31), torch.arange(31, 59))
+    g1, g2 = (torch.Generator().manual_seed(7) for _ in range(2))
+    total = 0
+    for step in range(1, 26):
+        a = trainer.sample_ratio_batch(pools, 256, ratio, g1, step=step)
+        b = trainer.sample_ratio_batch(pools, 256, ratio, g2, step=step)
+        assert torch.equal(a, b)
+        total += int((a < 31).sum())
+        assert int((a < 31).sum()) == shared.formation_count(ratio, 256, step)
+        assert total == shared.cumulative_formation(ratio, 256, step)
+
+
+def test_hundred_percent_does_not_require_operation_samples():
+    pools = (torch.arange(3), torch.empty(0, dtype=torch.long))
+    ids = trainer.sample_ratio_batch(pools, 256, 1.0, torch.Generator())
+    assert len(ids) == 256 and ids.max() < 3
+    with pytest.raises(ValueError, match="empty"):
+        trainer.sample_ratio_batch(pools, 256, .9, torch.Generator())
+
+
+@pytest.mark.parametrize("ratio", shared.RATIOS)
+def test_actual_decile_cpu_training_with_final_checkpoint(source, monkeypatch, ratio):
+    bundle, out, _ = source
+    data = trainer.pilot.Data(bundle["inputs"]["data"], "process", "video", 2, torch.device("cpu"))
+    val = trainer.pilot.Data(bundle["inputs"]["data"], "state", "video", 2, torch.device("cpu"))
+    population = audit.population(bundle["inputs"]["data"], 2)
+    args = SimpleNamespace(**{**shared.TRAIN_DEFAULTS, "dim": 12, "depth": 1, "heads": 3,
+        "formation_ratio": ratio, "batch": 8, "steps": 5, "seed": 0, "log_every": 1, "val_every": 1})
+    original = trainer.models.build_model
+    monkeypatch.setattr(trainer.models, "build_model", lambda cfg: original({**cfg, "emb": 4}))
+    config = {"version": shared.VERSION, "pools": population["pools"], "args": vars(args)}
+    target = out / "decile_cpu"
+    target.mkdir()
+    done = trainer.fit(data, val, args, target, config)
+    assert done["samples_seen"] == 40
+    assert done["formation_samples_seen"] == round(40 * ratio)
+    assert done["operation_samples_seen"] == 40 - round(40 * ratio)
+    assert done["form_frac_mean"] == ratio
+    checkpoint = torch.load(target / "ckpt.pt", map_location="cpu", weights_only=True)
+    assert checkpoint["step"] == 5 and checkpoint["selection"] == "last"
+    rows = [json.loads(line) for line in (target / "train_log.jsonl").read_text().splitlines() if "samples_seen" in line]
+    for record in rows:
+        step = record["step"]
+        assert record["formation_samples_seen"] == shared.cumulative_formation(ratio, 8, step)
+
+
+def test_short_custom_budget_reports_actual_quota_not_target_rounding():
+    result = shared.budget(.1, steps=1)
+    assert result["formation_samples"] == 25
+    assert result["actual_formation_fraction"] == 25 / 256
+    assert shared.formation_count(.1, step=5) == 26
+    for step in (0, -1, 1.5):
+        with pytest.raises(ValueError):
+            shared.formation_count(.1, step=step)
+
+
+def test_eleven_dose_keys_do_not_collide_and_legacy_keys_stay_stable():
+    assert len({shared.dose_key(r) for r in shared.RATIOS}) == 11
+    assert shared.dose_key(.1) == "p010" and shared.dose_key(1) == "r256"
+    assert [shared.dose_key(r) for r in (0, .125, .25, .5, .75)] == ["r000", "r032", "r064", "r128", "r192"]
+
+
+def test_legacy_five_dose_protocol_remains_unchanged_and_cannot_be_overwritten(source, monkeypatch):
+    bundle, out, _ = source
+    old_ratios = (0, .125, .25, .5, .75)
+    legacy = deepcopy(bundle)
+    legacy["manifest"]["protocol"] = shared.protocol(old_ratios, steps=1000)
+    legacy["manifest"]["protocol"]["episodes"] = 2
+    assert "batch_quota" not in legacy["manifest"]["protocol"]
+    shared.write_json(out / "source.json", legacy["manifest"])
+    before = (out / "source.json").read_bytes()
+    old_audit = audit.audit_sampling(legacy, "unit")
+    old_rows = make_jobs.save_jobs("unit", old_audit)
+    assert len(old_rows) == 5
+    monkeypatch.setattr(shared, "validate_source", lambda *a: legacy)
+    assert shared.verify_manifest("unit") == legacy
+    assert audit.verify_audit("unit") == old_audit
+    with pytest.raises(ValueError, match="budget changed"):
+        shared.bind_run("unit", bundle)
+    assert before == (out / "source.json").read_bytes()
+
+
+def test_eleven_dose_report_covers_endpoints_and_integer_ranges():
+    scores, ids = synthetic_scores()
+    report = analysis.summarize(scores, ids, shared.common.SPLITS, boot=20)
+    assert report["settings"]["dose_count"] == 11
+    assert report["settings"]["full_eleven_dose_design"] is True
+    text = analysis.markdown(report)
+    assert "完整11档" in text and "100.0%" in text and "25–26/230–231" in text
+    legacy = (0, .125, .25, .5, .75)
+    scores, ids = synthetic_scores(legacy)
+    report = analysis.summarize(scores, ids, shared.common.SPLITS, boot=20, ratios=legacy)
+    assert report["settings"]["dose_count"] == 5
+    assert "本次为5档" in analysis.markdown(report)

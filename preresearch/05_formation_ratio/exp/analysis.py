@@ -60,8 +60,10 @@ def summarize(samples, split_ids, splits, boot=2000, seed=12345, ratios=RATIOS, 
                 raise ValueError("non-ranking scores must be finite for every scene")
     report = {"settings": {"ratios": list(ratios), "episodes": EPISODES, "steps": steps,
                            "epochs": None, "mode": MODE, "training_seeds": [0], "bootstrap": boot,
-                           "bootstrap_seed": seed, "seed_std": None, "full_five_dose_design": ratios == RATIOS,
+                           "bootstrap_seed": seed, "seed_std": None, "dose_count": len(ratios),
+                           "full_eleven_dose_design": ratios == RATIOS,
                            "all_doses_retrained": True, "reuse_main_endpoints": False,
+                           "checkpoint_selection": "last", "checkpoint_step": steps, "weights": "ema",
                            "uncertainty": "paired scenes, not training seed variability"},
               "budgets": {dose_key(r): budget(r, steps) for r in ratios}, "by_split": {}}
     x = np.array(ratios)
@@ -112,16 +114,21 @@ def load_results(name, audited):
 
 def markdown(report):
     ratios = report["settings"]["ratios"]
-    design = "默认五档" if report["settings"]["full_five_dose_design"] else "显式子集"
+    design = "0%至100%的完整11档" if tuple(ratios) == RATIOS else f"{len(ratios)}档"
     lines = ["# 实验05：形成监督采样比例", "", f"本次为{design}；形成监督比例：" + "、".join(f"{r:.1%}" for r in ratios) + "。", "",
              "所有档位使用同一份冻结的原始process轨迹和相同的合法相邻帧转移。每个batch分别从形成池、操作池有放回抽样，不压缩建造过程，也不改物理时间。", "",
-             "五档全部从头训练，包括0%和50%。实验03旧模型不进入等预算曲线；本次比例不是F帧数，也不是原五轮训练的换算。", "",
+             f"本次{len(ratios)}档全部从头训练，包括0%和50%。实验03旧模型不进入等预算曲线；本次比例不是F帧数，也不是原五轮训练的换算。", "",
+             f"本报告只评测训练完成时第{report['settings']['checkpoint_step']}步的EMA模型，不使用验证分数最好的早期模型。", "",
              "## 1. 统一预算与实际监督量", "", "| 形成监督比例 | 每batch形成/操作 | 更新数 | 监督样本总数 | 形成样本数 | 操作样本数 |",
              "|---:|---:|---:|---:|---:|---:|"]
     for r in ratios:
         b = report["budgets"][dose_key(r)]
-        lines.append(f"| {r:.1%} | {b['formation_per_batch']}/{b['operation_per_batch']} | {b['steps']} | {b['samples']} | {b['formation_samples']} | {b['operation_samples']} |")
-    lines += ["", "更新数、batch、学习率进度和验证时点一致。有放回采样不代表完整覆盖全部转移，不能描述为完整epochs。", "", "## 2. 各类测试", ""]
+        form_range = b.get("formation_per_batch_range", [b["formation_per_batch"]] * 2)
+        op_range = b.get("operation_per_batch_range", [b["operation_per_batch"]] * 2)
+        fmt_range = lambda values: str(values[0]) if values[0] == values[1] else f"{values[0]}–{values[1]}"
+        lines.append(f"| {r:.1%} | {fmt_range(form_range)}/{fmt_range(op_range)} | {b['steps']} | {b['samples']} | {b['formation_samples']} | {b['operation_samples']} |")
+    lines += ["", "batch=256时，10%对应平均25.6个形成样本。实际每步使用25或26个，按累计配额分配，默认94,400步后的总占比精确为10%。其他档位同样处理。0%只抽操作，100%只抽形成。", "",
+              "更新数、batch、学习率进度和验证时点一致。有放回采样不代表完整覆盖全部转移，不能描述为完整epochs。", "", "## 2. 各类测试", ""]
     for metric in METRICS:
         lines += [f"### {metric}", "", "| 测试 | " + " | ".join(f"{r:.1%}" for r in ratios) + " |", "|---|" + "---:|" * len(ratios)]
         for split, result in report["by_split"].items():

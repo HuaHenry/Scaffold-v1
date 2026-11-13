@@ -12,7 +12,7 @@ import torch
 
 from .audit import verify_audit
 from .shared import (MODE, PACKAGE, VERSION, array_sha1, check_output_tree,
-                     common, expected_data_hashes, formation_count, resolve_file,
+                     common, cumulative_formation, expected_data_hashes, formation_count, resolve_file,
                      training_args, validate_config, validate_done, write_json)
 
 pilot = import_module(f"{PACKAGE}.train")
@@ -26,8 +26,8 @@ def phase_pools(pairs, phase):
     return tuple(torch.nonzero(labels == k, as_tuple=True)[0] for k in (0, 1))
 
 
-def sample_ratio_batch(pools, batch, ratio, generator):
-    n_form = formation_count(ratio, batch)
+def sample_ratio_batch(pools, batch, ratio, generator, step=1):
+    n_form = formation_count(ratio, batch, step)
     device = pools[0].device
     selected = []
     for pool, count in zip(pools, (n_form, batch - n_form)):
@@ -52,7 +52,7 @@ def fit(data, val, args, out, config):
     dev = data.pairs.device
     pairs, pools = data.chain_pairs(1), phase_pools(data.chain_pairs(1), data.phase)
     verify_pools(data, pools, config["pools"])
-    n_form = formation_count(args.formation_ratio, args.batch)
+    formation_count(args.formation_ratio, args.batch)
     model = models.build_model({"dim": args.dim, "depth": args.depth, "heads": args.heads}).to(dev)
     ema = copy.deepcopy(model).eval()
     for parameter in ema.parameters():
@@ -71,7 +71,8 @@ def fit(data, val, args, out, config):
     accumulated_accuracy = torch.zeros((), device=dev)
     accumulated_steps = 0
     start = time.monotonic()
-    print(f"[train] ratio={args.formation_ratio:g} F/O per batch={n_form}/{args.batch - n_form}, "
+    print(f"[train] ratio={args.formation_ratio:g} target F/O batch means="
+          f"{args.formation_ratio * args.batch:g}/{(1 - args.formation_ratio) * args.batch:g}; cumulative integer quota; "
           f"pairs={len(pairs)} updates={args.steps} device={dev}; original physical transitions", flush=True)
     with (out / "train_log.jsonl").open("w") as log:
         for step in range(1, args.steps + 1):
@@ -79,7 +80,8 @@ def fit(data, val, args, out, config):
             lr = pilot.lr_at(step, args)
             for group in opt.param_groups:
                 group["lr"] = lr
-            indices = sample_ratio_batch(pools, args.batch, args.formation_ratio, generator)
+            n_form = formation_count(args.formation_ratio, args.batch, step)
+            indices = sample_ratio_batch(pools, args.batch, args.formation_ratio, generator, step=step)
             e, t = pairs[indices, 0], pairs[indices, 1]
             pf, pb, tf, tb, act = data.batch(e, t)
             with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=dev.type == "cuda"):
@@ -127,19 +129,23 @@ def fit(data, val, args, out, config):
                 print(f"[val] step {step} cascade_acc={last_val['cascade_acc']:.4f}", flush=True)
                 if pilot.better_validation(last_val, best_val):
                     best_val, best_step = last_val.copy(), step
-                    torch.save({"model": model.state_dict(), "ema": ema.state_dict(), "cfg": model.cfg,
-                                "step": step, "args": config["args"], "selection": "val_cascade_acc"}, out / "ckpt.tmp")
-                    (out / "ckpt.tmp").replace(out / "ckpt.pt")
     if best_step is None:
-        raise ValueError("training finished without a valid selected checkpoint")
+        raise ValueError("training finished without a valid validation record")
+    if seen != args.steps * args.batch or form_seen != cumulative_formation(args.formation_ratio, args.batch, args.steps):
+        raise ValueError("training supervision exposure differs from the cumulative quota")
+    if not all(torch.isfinite(p).all() for p in ema.parameters()):
+        raise ValueError("final EMA contains nonfinite weights; refusing to commit training")
+    torch.save({"model": model.state_dict(), "ema": ema.state_dict(), "cfg": model.cfg,
+                "step": args.steps, "args": config["args"], "selection": "last", "weights": "ema"}, out / "ckpt.tmp")
+    (out / "ckpt.tmp").replace(out / "ckpt.pt")
     done = {"version": VERSION, "sampling_mode": MODE, "steps": args.steps, "epochs": None,
             "steps_per_epoch": None, "samples_seen": seen, "formation_samples_seen": form_seen,
             "operation_samples_seen": seen - form_seen, "formation_ratio": args.formation_ratio,
             "form_frac_mean": form_seen / seen, "n_pairs": len(pairs), "seconds": time.monotonic() - start,
-            "val": last_val, "best_val": best_val, "best_step": best_step, "selection": "val_cascade_acc",
-            "ckpt_sha1": common.sha1_file(out / "ckpt.pt")}
+            "val": last_val, "best_val": best_val, "best_step": best_step, "selection": "last",
+            "checkpoint_step": args.steps, "weights": "ema", "ckpt_sha1": common.sha1_file(out / "ckpt.pt")}
     write_json(out / "done.json", done)
-    print(f"[train] complete ratio={args.formation_ratio:g}, best_step={best_step}: {common.rel(out)}", flush=True)
+    print(f"[train] complete ratio={args.formation_ratio:g}, final checkpoint step={args.steps}: {common.rel(out)}", flush=True)
     return done
 
 

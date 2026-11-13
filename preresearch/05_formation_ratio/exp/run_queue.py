@@ -13,9 +13,11 @@ from .shared import PROJECT, check_output_tree, common, record_eval, resolve_fil
 import zipfile
 
 
-def run_job(row, card, audited, interval=30, stop=None):
+def run_job(row, card, audited, interval=30, stop=None, evaluate_only=False):
     stop = stop if stop is not None else Event()
     out = check_output_tree(resolve_file(row["out"]))
+    if evaluate_only:
+        validate_done(out, row, audited)
     out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="" if card == "cpu" else card,
                PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1")
@@ -80,7 +82,7 @@ def run_job(row, card, audited, interval=30, stop=None):
         return False
 
 
-def execute_queue(name, cards="0,1,2,3", interval=30):
+def execute_queue(name, cards="0,1,2,3", interval=30, evaluate_only=False):
     devices = [c.strip() for c in cards.split(",")]
     if not devices or any(not c or (c != "cpu" and not c.isdigit()) for c in devices) or len(set(devices)) != len(devices) or interval <= 0:
         raise ValueError("devices must be distinct and progress interval positive")
@@ -88,6 +90,9 @@ def execute_queue(name, cards="0,1,2,3", interval=30):
     rows = common.load_json(run_path(name) / "jobs/formation_ratio.json")
     if rows != jobs(name, audited):
         raise ValueError("job list differs from audited formation experiment")
+    if evaluate_only:
+        for row in rows:
+            validate_done(resolve_file(row["out"]), row, audited)
     queue, stop = Queue(), Event()
     for row in rows:
         queue.put(row)
@@ -99,7 +104,7 @@ def execute_queue(name, cards="0,1,2,3", interval=30):
                 row = queue.get_nowait()
             except Empty:
                 return ok
-            ok = run_job(row, card, audited, interval, stop) and ok
+            ok = run_job(row, card, audited, interval, stop, evaluate_only=evaluate_only) and ok
         return False
 
     pool = ThreadPoolExecutor(max_workers=min(len(devices), len(rows)))
