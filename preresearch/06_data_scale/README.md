@@ -232,7 +232,7 @@ bash run_all.sh --run <运行名> --stage analyze --allow-incomplete
 
 ## 9. 验证
 
-已在 `zhouqi` 环境通过97项测试，包括：
+已在 `zhouqi` 环境通过102项测试（61.01秒），包括：
 
 - 五档预算和60个互不冲突的新任务；非法N、种子和GPU编号拒绝。
 - 冻结来源、嵌套前缀、转移预算及重置边界。

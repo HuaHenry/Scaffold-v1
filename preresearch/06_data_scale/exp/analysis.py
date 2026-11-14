@@ -77,6 +77,7 @@ def summarize(samples, ids, sizes, seeds, steps, boot=10000, seed=12345):
                 slope = stats.estimate(w @ delta, boot, seed, (split, metric, reference, "slope_delta"))
                 slope["seed_std"] = seed_std(np.einsum("n,nsk->sk", w, raw_delta).mean(axis=1)) if finite.any() else None
                 endpoints = stats.estimate(delta[-1] - delta[0], boot, seed, (split, metric, reference, "endpoint_gain_change"))
+                endpoints["seed_std"] = seed_std((raw_delta[-1] - raw_delta[0]).mean(axis=1)) if finite.any() else None
                 contrasts[f"process_minus_{reference}"] = {"by_size": per_n, "slope_difference": slope,
                                                            "largest_minus_smallest_gain": endpoints}
             block["metrics"][metric] = {"n_cases": int(finite.sum()), "curves": curves,
@@ -93,13 +94,17 @@ def load_results(name, audited, allow_incomplete=False):
         raise ValueError(f"{len(missing)} cells incomplete; finish queue or explicitly use --allow-incomplete")
     complete_rows, diagnostics = [], {}
     for row in rows:
-        if row["id"] in missing:
-            continue
         out = resolve_file(row["out"])
+        if not (out / "train_complete.json").exists():
+            if (out / "eval_complete.json").exists():
+                raise ValueError("committed evaluation exists without committed training")
+            continue
         done = validate_done(out, row, audited)
+        diagnostics[row["id"]] = {k: done[k] for k in ("val", "train_raw", "train_ema", "seconds", "samples_seen")}
+        if not (out / "eval_complete.json").exists():
+            continue
         validate_eval(out, audited, done)
         complete_rows.append(row)
-        diagnostics[row["id"]] = {k: done[k] for k in ("val", "train_raw", "train_ema", "seconds", "samples_seen")}
     p = audited["protocol"]
     usable = [s for s in p["training_seeds"] if
               all(r["id"] not in missing for r in rows if r["seed"] == s)]

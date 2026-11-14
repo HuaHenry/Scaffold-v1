@@ -293,7 +293,30 @@ def test_single_seed_std_missing_and_bootstrap_reproducible():
     args = artificial_scores(seeds=(0,))
     first = analysis.summarize(*args[:2], args[2], args[3], 94400, boot=100)
     assert first == analysis.summarize(*args[:2], args[2], args[3], 94400, boot=100)
-    assert first["by_split"]["id"]["metrics"]["cascade_f1"]["curves"]["state"]["5120"]["seed_std"] is None
+    block = first["by_split"]["id"]["metrics"]["cascade_f1"]
+    assert block["curves"]["state"]["5120"]["seed_std"] is None
+    assert block["contrasts"]["process_minus_state"]["largest_minus_smallest_gain"]["seed_std"] is None
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_endpoint_gain_change_reports_seed_std(empty):
+    samples, ids, sizes, seeds = artificial_scores()
+    for s in seeds:
+        for metric in shared.METRICS:
+            samples[(sizes[-1], "process", s)][metric] += s * .02
+    if empty:
+        for values in samples.values():
+            values["rank_acc"][:] = np.nan
+    report = analysis.summarize(samples, ids, sizes, seeds, 94400, boot=20)
+    for block in report["by_split"].values():
+        for metric in shared.METRICS:
+            for contrast in block["metrics"][metric]["contrasts"].values():
+                endpoint = contrast["largest_minus_smallest_gain"]
+                if empty and metric == "rank_acc":
+                    assert endpoint["seed_std"] is None and endpoint["mean"] is None
+                else:
+                    assert endpoint["seed_std"] == pytest.approx(.02)
+                    assert endpoint["mean"] == pytest.approx(.08)
 
 
 def test_missing_cell_not_treated_as_zero():
@@ -364,14 +387,25 @@ def test_allow_incomplete_uses_only_globally_complete_seeds(source, monkeypatch)
         analysis.load_results("unit", audit, True)
 
 
-def test_incomplete_flag_does_not_hide_corrupt_committed_results(source, monkeypatch):
+@pytest.mark.parametrize("evaluated", [True, False])
+def test_incomplete_flag_does_not_hide_corrupt_committed_results(source, monkeypatch, evaluated):
     _, audit, _, rows = source
     out = shared.resolve_file(rows[0]["out"])
     out.mkdir(parents=True)
     shared.write_json(out / "train_complete.json", {})
-    shared.write_json(out / "eval_complete.json", {})
+    if evaluated:
+        shared.write_json(out / "eval_complete.json", {})
     monkeypatch.setattr(analysis, "validate_done", lambda *a: (_ for _ in ()).throw(ValueError("corrupt committed result")))
     with pytest.raises(ValueError, match="corrupt"):
+        analysis.load_results("unit", audit, True)
+
+
+def test_committed_evaluation_without_training_is_not_plain_missing(source):
+    _, audit, _, rows = source
+    out = shared.resolve_file(rows[0]["out"])
+    out.mkdir(parents=True)
+    shared.write_json(out / "eval_complete.json", {})
+    with pytest.raises(ValueError, match="without committed training"):
         analysis.load_results("unit", audit, True)
 
 
