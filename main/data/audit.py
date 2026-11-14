@@ -9,7 +9,7 @@ from ..tasks.registry import TASKS, select
 from .storage import Dataset
 
 
-def verify(root, full=True):
+def verify(root, full=True, progress=None):
     root = safe_path(root)
     marker = load_json(root / "complete.json")
     manifest = load_json(root / "manifest.json")
@@ -19,7 +19,7 @@ def verify(root, full=True):
         raise ValueError("task registry differs from frozen dataset")
     if manifest["code"] != code_identity():
         raise ValueError("data/code identity differs; keep frozen code or create a new dataset")
-    if full and files_identity(root, ("complete.json",)) != marker["hashes"]:
+    if full and files_identity(root, ("complete.json",), progress=progress) != marker["hashes"]:
         raise ValueError("frozen data files changed or files were added/removed")
     for task, meta in manifest["task_data"].items():
         for split, conditions in (("train", CONDITIONS), ("validation", ("state",))):

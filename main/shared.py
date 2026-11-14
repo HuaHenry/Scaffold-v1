@@ -108,18 +108,30 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def file_hash(path):
-    h = hashlib.sha256()
+def file_hash(path, progress=None):
+    h, done = hashlib.sha256(), 0
+    total = Path(path).stat().st_size
     with Path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
             h.update(block)
+            done += len(block)
+            if progress is not None:
+                progress(done, total)
     return h.hexdigest()
 
 
-def files_identity(root, excludes=()):
+def files_identity(root, excludes=(), progress=None):
     root = Path(root)
-    return {p.relative_to(root).as_posix(): file_hash(p) for p in sorted(root.rglob("*"))
-            if p.is_file() and p.name not in excludes and not p.name.endswith(".lock")}
+    files = [p for p in sorted(root.rglob("*"))
+             if p.is_file() and p.name not in excludes and not p.name.endswith(".lock")]
+    total, done, hashes = sum(p.stat().st_size for p in files), 0, {}
+    if progress is not None:
+        progress(0, total)
+    for p in files:
+        callback = (lambda count, size: progress(done + count, total)) if progress is not None else None
+        hashes[p.relative_to(root).as_posix()] = file_hash(p, progress=callback) if callback else file_hash(p)
+        done += p.stat().st_size
+    return hashes
 
 
 def code_identity():

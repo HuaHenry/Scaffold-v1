@@ -14,7 +14,7 @@ def main(argv=None):
     ap.add_argument("--stage", choices=("prepare", "train", "evaluate", "analyze"), required=True)
     ap.add_argument("--data", type=Path)
     ap.add_argument("--tasks", help="prepare only; default all tasks in the frozen dataset")
-    ap.add_argument("--episodes", type=int)
+    ap.add_argument("--episodes", type=int, help="prepare only; use the first N episodes per task from a larger frozen dataset")
     ap.add_argument("--formation-ratio")
     ap.add_argument("--selection-note", default="")
     ap.add_argument("--steps", type=int, help="prepare only; default94400")
@@ -39,6 +39,8 @@ def main(argv=None):
                           a.steps if a.steps is not None else 94400,
                           seeds, ("single", "mixed") if modes == "both" else (modes,),
                           a.mixed_budget or "per_task", selection_note=a.selection_note)
+        for task, prefix in p["training_prefixes"].items():
+            print(f"[训练数据] {task}: 已生成{prefix['available_episodes']:,}集，使用前{prefix['used_episodes']:,}集；验证/测试不截断", flush=True)
         from ..shared import disjoint
         disjoint(out, [a.data])
         if a.dry_run:

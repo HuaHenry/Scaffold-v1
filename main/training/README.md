@@ -8,6 +8,8 @@
 
 从源码目录 `main` 执行 `bash run_main.sh --help`；数据生成必须已经单独完成。prepare必填 `--data --run --episodes --formation-ratio --selection-note`。其余默认仅训练种子0、steps94400、modes both、mixed-budget per_task。无需传 `--seeds`；显式指定时也只能给一个非负种子，多个种子会在启动任务前拒绝。
 
+`--episodes N` 指每任务使用前N集，不要求与生成时M相同；N≤各任务冻结训练总量即可。prepare会打印各任务已生成M与实际使用N，协议 `training_prefixes` 固定 `[0,N)`。四条件单训/混训都只抽选定前缀，验证/测试不截断。换N必须新run，但可以继续使用同一较大DATA，不改原文件。
+
 `process/shuffle`按相同R抽样；state/partial仅操作。形成转移1～31；混合操作转移33～39、41～47、49～55、57～63，保留shuffle乱序转移。R需严格在0～1之间。
 
 ## 任务与预算

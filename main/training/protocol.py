@@ -43,8 +43,11 @@ def make_protocol(manifest, data, tasks, episodes, formation_ratio, steps=94400,
         raise ValueError("dim must be divisible by heads")
     if not 0 <= settings["ema"] < 1 or settings["lr"] <= 0 or settings["lr_min"] < 0:
         raise ValueError("invalid EMA or learning rate")
+    prefixes = {task: {"available_episodes": manifest["task_data"][task]["train_episodes"],
+                       "used_episodes": episodes, "start": 0, "stop": episodes, "step": 1}
+                for task in tasks}
     return {"version": VERSION, "tasks": tasks, "episodes_per_task": episodes,
-            "formation_ratio": str(r), "steps_single": steps, "training_seeds": seeds,
+            "training_prefixes": prefixes, "formation_ratio": str(r), "steps_single": steps, "training_seeds": seeds,
             "modes": modes, "mixed_budget": mixed_budget, "settings": settings,
             "conditions": list(CONDITIONS), "selection_note": selection_note,
             "data": str(Path(data).resolve()), "data_manifest_sha256": file_hash(Path(data) / "manifest.json"),

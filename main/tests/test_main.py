@@ -564,7 +564,7 @@ def test_t01_source_audit_changes_reject_same_path_reuse(tmp_path, monkeypatch, 
     monkeypatch.setattr(generate.common, "load_summary", lambda p: {"profile": "simple_to_complex"})
     monkeypatch.setattr(generate, "legacy_count", lambda p: 81920 if p == paths["data"] else 32)
     monkeypatch.setattr(generate, "legacy_task", lambda *a: {"test_scenes": 512})
-    monkeypatch.setattr(generate, "verify", lambda p: shared.load_json(Path(p) / "manifest.json"))
+    monkeypatch.setattr(generate, "verify", lambda p, **kwargs: shared.load_json(Path(p) / "manifest.json"))
     config = {"tasks": ["T01"], "episodes": 1, "val_episodes": 1, "test_scenes": 1, "seed": 1, "max_attempts": 100}
     generate.generate(out, config, source)
     request = shared.load_json(out / "request.json")

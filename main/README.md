@@ -64,29 +64,32 @@ cd /data/huazhouqi/Scaffold-v1/Scaffold-v1/main
 
 ## 5. 数据生成：单独运行
 
-先由05/06确定每任务的episode数量。下面的N和R由你填写，不能将示例值当作已选最优设置：
+**可以先生成较大的M，等06结果后再选训练N；只要N≤M，就不需要重新生成数据。** 生成端 `--episodes M` 是每任务保存数量，训练prepare的 `--episodes N` 是每任务实际使用数量，两者可以不同。
+
+以下以M=81920覆盖06全部五档；仅训练数组约1.53TiB，先确认磁盘足够。也可降低M，但之后不能选超过M的训练量。R示例不是已经确定的最优比例。
 
 ```bash
-export N=5120
-export R=0.4
-export DATA=/data/huazhouqi/Scaffold-v1/Scaffold-v1/experiments/main/datasets/v1
-export RUN=/data/huazhouqi/Scaffold-v1/Scaffold-v1/experiments/main/runs/main_v1
+export M=81920
+export DATA=/data/huazhouqi/Scaffold-v1/Scaffold-v1/experiments/main/datasets/m81920_v1
 ```
 
-只读预检数据来源和存储估计：
+只读预检来源和存储估计：
 
 ```bash
-bash generate_data.sh --out "$DATA" --episodes "$N" --dry-run
+bash generate_data.sh --out "$DATA" --episodes "$M" --dry-run
 ```
 
-生成17任务数据：
+CPU生成17任务数据，默认每10秒打印进度；四卡还在训练时建议只用2个CPU生成进程：
 
 ```bash
-bash generate_data.sh --out "$DATA" --episodes "$N" \
-  --val-episodes 32 --test-scenes 128 --seed 20261113 --workers 4
+CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  bash generate_data.sh --out "$DATA" --episodes "$M" \
+  --val-episodes 32 --test-scenes 128 --seed 20261113 --workers 2 --progress-every 10
 ```
 
-- T01流式导入当前03冻结数据的前N集，逐位保留帧和编码后的动作，不重新生成来源。验证使用实际冻结的完整32集，测试保留完整512场景及原四划分。验证summary中的部分shape字段陈旧，上限以真实NPZ数组头为准，不静默截断。
+进度包含任务/划分、完成数量和百分比、速度、已用时间、当前阶段ETA及已提交任务总数。新任务样本剩余时间是随实测速率更新的粗估，不含T01导入、写盘和审计；这些阶段单独显示。没有足够数据估算时显示“估算中”，最后仍需等待“整体完成，冻结校验通过”。
+
+- T01流式导入当前03冻结数据的前M集，逐位保留帧和编码后的动作，不重新生成来源。验证使用实际冻结的完整32集，测试保留完整512场景及原四划分。验证summary中的部分shape字段陈旧，上限以真实NPZ数组头为准，不静默截断。
 - 新16任务由现有core动作和tick生成，保存真实形成轨迹、四条件训练数据、独立验证和测试。
 - 新任务使用明确的空间迁移划分：训练的模板锚点x为4～22，验证25～30，测试34～地图允许范围。**这不是训练分布内ID测试。** 各任务训练、验证、测试最终状态哈希无交集；训练内部允许重复，实际不同终态数和重复数均记录。
 - `--workers`只控制按任务CPU并行，不改变种子或数据身份。一个任务内部顺序固定。
@@ -102,10 +105,13 @@ python -m main.data.audit --data "$DATA"
 
 ## 6. 固定setting：准备主实验，不训练
 
-回到源码目录 `main` 后执行：
+等05/06结果后选择N和R；下面以N=20480、R=0.4示例，不是已确定的最优设置。训练只取每任务 `[0,N)`，单训和混训的四条件使用同一前缀，验证/测试不变。换N要创建新run，复用同一DATA即可。
 
 ```bash
 cd /data/huazhouqi/Scaffold-v1/Scaffold-v1/main
+export N=20480
+export R=0.4
+export RUN=/data/huazhouqi/Scaffold-v1/Scaffold-v1/experiments/main/runs/main_n${N}_v1
 bash run_main.sh --stage prepare --run "$RUN" --data "$DATA" \
   --episodes "$N" --formation-ratio "$R" \
   --selection-note "记录05/06或开发集如何选择N和R，并注明是否使用过T01测试成绩" \

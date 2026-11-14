@@ -41,7 +41,7 @@ def flush(arrays):
             array.flush()
 
 
-def stream_npz_prefix(path, key, destination, count, chunk=64):
+def stream_npz_prefix(path, key, destination, count, chunk=64, progress=None):
     with zipfile.ZipFile(path) as z, z.open(f"{key}.npy") as source:
         version = np.lib.format.read_magic(source)
         if version == (1, 0):
@@ -59,22 +59,33 @@ def stream_npz_prefix(path, key, destination, count, chunk=64):
             if len(data) != n * per_episode:
                 raise ValueError("truncated legacy archive")
             destination[start:start + n] = np.frombuffer(data, np.uint8).reshape(n, 64, H, W)
+            if progress is not None:
+                progress((start + n) * per_episode, count * per_episode)
 
 
-def import_legacy(root, source, count, conditions=CONDITIONS):
-    arrays = allocate(root, count, conditions)
+def import_legacy(root, source, count, conditions=CONDITIONS, reporter=None):
+    from .progress import Reporter
+    reporter = reporter or Reporter("T01")
+    split = Path(root).name
+    with reporter.stage(f"{split} 分配磁盘数组"):
+        arrays = allocate(root, count, conditions)
     for c in conditions:
         for k in ("fg", "bg"):
-            stream_npz_prefix(Path(source) / f"train_{c}.npz", k, arrays[c][k], count)
-        acts = common.load_json(Path(source) / f"train_{c}_actions.json")["actions"]
+            with reporter.stage(f"{split}/{c}/{k} 解压导入", count * 64 * H * W, "字节"):
+                stream_npz_prefix(Path(source) / f"train_{c}.npz", k, arrays[c][k], count, progress=reporter.update)
+        with reporter.stage(f"{split}/{c} 读取动作清单"):
+            acts = common.load_json(Path(source) / f"train_{c}_actions.json")["actions"]
         if len(acts) < count:
             raise ValueError("legacy action count is smaller than requested prefix")
-        for e in range(count):
-            if len(acts[e]) != 64:
-                raise ValueError("legacy episode action length differs")
-            arrays[c]["act"][e] = np.stack([common.encode_actions(a) for a in acts[e]]).astype(np.uint8)
+        with reporter.stage(f"{split}/{c} 编码动作", count, "集"):
+            for e in range(count):
+                if len(acts[e]) != 64:
+                    raise ValueError("legacy episode action length differs")
+                arrays[c]["act"][e] = np.stack([common.encode_actions(a) for a in acts[e]]).astype(np.uint8)
+                reporter.update(e + 1)
         del acts
-    flush(arrays)
+    with reporter.stage(f"{split} 同步磁盘"):
+        flush(arrays)
     return arrays
 
 
@@ -94,5 +105,7 @@ class Dataset:
         self.condition = condition
 
     def batch(self, e, t):
+        if np.any(np.asarray(e) < 0) or np.any(np.asarray(e) >= self.count):
+            raise ValueError("episode index is outside the selected training prefix")
         return tuple(np.asarray(self.arrays[k][e, tt]).copy() for k, tt in
                      (("fg", t - 1), ("bg", t - 1), ("fg", t), ("bg", t), ("act", t)))

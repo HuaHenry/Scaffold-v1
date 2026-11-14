@@ -10,6 +10,8 @@ game_code/.playwright-cli/
 # experiment results (checkpoints are large and reproducible)
 experiments/
 
+dataset/
+
 # generated data: regenerate with `python run.py --data-v3`
 game_code/output/
 
