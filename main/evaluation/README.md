@@ -1,6 +1,6 @@
 # 统一评测与分析
 
-`evaluate.py`评测最终EMA，`analyze.py`生成单训/混训各任务四条件表及图。外层入口为 `run_main.sh --stage evaluate/analyze`，不生成或训练缺失模型。
+源码在 `main/evaluation/`。`evaluate.py`评测最终EMA，`analyze.py`生成单训/混训各任务四条件表及图。从源码 `main` 目录调用外层入口 `run_main.sh --stage evaluate/analyze`；结果写入 `experiments/main/runs/<运行名>/`，不生成或训练缺失模型。
 
 ## 一致协议
 

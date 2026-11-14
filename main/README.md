@@ -7,7 +7,7 @@
 ## 1. 目录结构
 
 ```text
-experiments/main/
+main/
   README.md
   requirements.txt
   shared.py
@@ -19,11 +19,14 @@ experiments/main/
   evaluation/               # 统一32步评测、配对统计、表格和图
   tests/                    # 微型真实物理、CPU训练与评测测试
   extensions/               # 后续消融/预算/长程扩展的位置与接口约定
+
+experiments/main/            # 仅存放实验结果，不放源码
   datasets/<数据版本>/       # 运行时生成，忽略版本管理
   runs/<运行名>/             # 运行时产生，忽略版本管理
+  generate_<时间>.log        # 数据生成日志
 ```
 
-每个模块目录均有自己的README。源码留在用户指定的 `experiments/main`；项目 `.gitignore` 已区分这里的源码和大型运行产物，不影响旧预实验目录。
+每个模块目录均有自己的README。源码已迁移到项目根目录的 `main`，入口包名为 `main`；数据、训练结果和日志留在 `experiments/main`。项目 `.gitignore` 忽略整个实验结果目录，源码正常跟踪，不影响旧预实验结果。
 
 ## 2. 任务集：17个平行任务
 
@@ -54,7 +57,7 @@ experiments/main/
 
 ```bash
 conda activate zhouqi
-cd /data/huazhouqi/Scaffold-v1/Scaffold-v1/experiments/main
+cd /data/huazhouqi/Scaffold-v1/Scaffold-v1/main
 ```
 
 依赖范围见 `requirements.txt`，不需要为现有环境重装。脚本自行切回项目根目录，因此可以从任意工作目录使用完整路径调用。可用 `PY=/已有环境/bin/python` 指定Python。
@@ -94,14 +97,15 @@ bash generate_data.sh --out "$DATA" --episodes "$N" \
 
 ```bash
 cd /data/huazhouqi/Scaffold-v1/Scaffold-v1
-python -m experiments.main.data.audit --data "$DATA"
+python -m main.data.audit --data "$DATA"
 ```
 
 ## 6. 固定setting：准备主实验，不训练
 
-回到 `experiments/main` 后执行：
+回到源码目录 `main` 后执行：
 
 ```bash
+cd /data/huazhouqi/Scaffold-v1/Scaffold-v1/main
 bash run_main.sh --stage prepare --run "$RUN" --data "$DATA" \
   --episodes "$N" --formation-ratio "$R" \
   --selection-note "记录05/06或开发集如何选择N和R，并注明是否使用过T01测试成绩" \
@@ -169,6 +173,7 @@ bash run_main.sh --stage analyze --run "$RUN" --boot 10000 --bootstrap-seed 1234
 - 已提交评测文件修改或损坏会报错，不自动覆盖；未提交评测可以重跑。
 - 同一流水线、训练任务和评测任务有互斥锁；拒绝输出路径符号链接以及与来源/数据重叠。
 - 修改源码后旧数据和旧运行会拒绝复用。这是有意的严格复现约束，修改实现应新建数据/运行，或保留冻结源码版本。实际加载模块的路径也受核验，拒绝外部 `FW_PROJECT/FW_GAME_CODE` 覆盖；03审计、04统计及公共模型/规则均在依赖身份中。
+- 本次迁移只移动源码和文档，没有移动或改写数据/模型记录。迁移前检查旧目录未发现 `datasets/`、`runs/`，因此没有对旧冻结身份增加例外。若另在其他路径生成过旧版main数据，请保留它们；新入口不会自动改写其哈希或假装身份兼容，需新建数据/运行或单独核对迁移兼容。
 - T01生成请求绑定源审计和输入哈希，同一路径换来源不能继续复用；完整导出数据用于训练时不需要重新读取原始03来源。
 - 所有任务已经完成、但manifest或整体完成标记提交中断时，可在同一请求下恢复最终提交，不重生成任务；仅残留 `pipeline.lock` 的prepare也可重试。
 - T01测试已用于05/06选setting时，只能作为锚点/开发结果，不宣称全新未使用测试。新增任务独立测试不参与设置选择。

@@ -13,7 +13,7 @@
 ## 接口约定
 
 1. 数据来源仍由 `data.audit.verify()`验证；不得自动重新生成已冻结任务。
-2. 主实验 `protocol.json`保持不可修改；扩展创建自己的协议、任务表和独立输出，建议 `runs/extensions/<模块>/<运行名>`。
+2. 主实验 `protocol.json`保持不可修改；扩展创建自己的协议、任务表和独立输出，建议 `experiments/main/runs/extensions/<模块>/<运行名>`，源码仍放在 `main/extensions/`。
 3. 复用 `training.sampler`、公共模型/损失和 `evaluation.evaluate`的状态评分接口；改变预算/采样/终态定义必须写清新版本。
 4. 新的形成比例端点不能偷偷进入四条件主实验，应由扩展模块自己的协议校验处理。
 5. 扩展优先在T01锚点任务验证，是否推广到全部任务由后续研究决定。

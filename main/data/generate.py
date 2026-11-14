@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..shared import (CONDITIONS, DEFAULT_SOURCE, ROOT, VERSION, code_identity, common,
+from ..shared import (CONDITIONS, DEFAULT_SOURCE, ROOT, RESULTS_ROOT, VERSION, code_identity, common,
                       disjoint, file_hash, files_identity, frozen_write, integer, load_json,
                       lock, name, safe_path, write_json, D)
 from ..tasks.registry import TASKS, select
@@ -121,9 +121,7 @@ def build_task(payload):
 
 def generate(out, config, source=DEFAULT_SOURCE, dry_run=False, workers=1):
     source = Path(source).expanduser().resolve()
-    out = disjoint(out, [ROOT / "runs", source, *[ROOT / p for p in ("tasks", "data", "training", "evaluation", "tests", "extensions")]])
-    if out == ROOT or out in ROOT.parents:
-        raise ValueError("dataset output cannot contain main source tree")
+    out = disjoint(out, [ROOT, RESULTS_ROOT / "runs", source])
     tasks = select(config["tasks"])
     config = {**config, "tasks": tasks}
     for k in ("episodes", "val_episodes", "test_scenes", "max_attempts"):

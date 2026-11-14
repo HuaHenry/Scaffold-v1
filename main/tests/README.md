@@ -4,10 +4,10 @@
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python -m pytest \
-  -q -p no:cacheprovider experiments/main/tests
+  -q -p no:cacheprovider main/tests
 ```
 
-已在zhouqi环境完成 **83项测试全部通过，175.85秒**。真实03来源导入测试未跳过，16个新任务均实际生成训练/验证/测试样例；四条件单训和混训均做过微型CPU训练、32步评测和完整分析发布。
+已在zhouqi环境完成 **89项测试全部通过，218.21秒**。真实03来源导入测试未跳过，16个新任务均实际生成训练/验证/测试样例；四条件单训和混训均做过微型CPU训练、32步评测和完整分析发布。
 
 所有数据、模型、图表测试使用pytest临时目录，不启动正式GPU训练，不写入旧预实验结果。
 
@@ -26,5 +26,7 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest \
 - FW_PROJECT/FW_GAME_CODE外部覆盖拒绝、缓存规则模块实际路径核验、03审计和04统计变化导致冻结身份失效。
 - 已完成单作业的训练/验证/bench同shape内容篡改拒绝，T01同路径源审计变化拒绝。
 - manifest、manifest临时文件、complete临时文件阶段中断恢复，不重生成已提交任务；prepare仅剩pipeline锁可重试。
+- 迁移后项目根、源码main与结果experiments/main分离；禁止将数据或训练结果写进源码树。
+- 从无关工作目录调用两个shell入口；真实CPU队列以 `main.training.train`、`main.evaluation.evaluate` 启动子进程，完成后纯评测复用不重训。
 
 测试不等于完成正式实验：没有生成17任务全量数据，没有验证数万episode的大规模生成吞吐，也没有训练216个正式模型。先小规模生成、核查样例和存储，再由用户启动正式运行。

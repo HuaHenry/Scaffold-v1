@@ -8,11 +8,11 @@ import numpy as np
 import pytest
 import torch
 
-from experiments.main import shared
-from experiments.main.tasks import registry, physics_tasks
-from experiments.main.data import generate, storage, audit
-from experiments.main.training import protocol, sampler, train, queue, main
-from experiments.main.evaluation import evaluate, analyze
+from main import shared
+from main.tasks import registry, physics_tasks
+from main.data import generate, storage, audit
+from main.training import protocol, sampler, train, queue, main
+from main.evaluation import evaluate, analyze
 
 
 @pytest.fixture(autouse=True)
@@ -352,7 +352,7 @@ def test_parallel_generation_cli_and_all_tasks_round_trip(tmp_path):
     import os
     out = tmp_path / "all-physics"
     tasks = list(registry.TASKS)[1:]
-    command = [__import__("sys").executable, "-m", "experiments.main.data.generate", "--out", str(out),
+    command = [__import__("sys").executable, "-m", "main.data.generate", "--out", str(out),
                "--tasks", ",".join(tasks), "--episodes", "1", "--val-episodes", "1", "--test-scenes", "1",
                "--seed", "71", "--workers", "2"]
     completed = subprocess.run(command, cwd=shared.PROJECT, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
@@ -468,7 +468,7 @@ def test_dependency_changes_invalidate_frozen_run(study, monkeypatch, relative):
 def test_external_game_override_rejected_at_import(tmp_path, variable):
     import os
     env = {**os.environ, variable: str(tmp_path / "external"), "PYTHONDONTWRITEBYTECODE": "1"}
-    result = subprocess.run([__import__("sys").executable, "-c", "import experiments.main.shared"],
+    result = subprocess.run([__import__("sys").executable, "-c", "import main.shared"],
                             cwd=shared.PROJECT, env=env, capture_output=True, text=True)
     assert result.returncode != 0 and variable + " must point to this repository" in result.stderr
 
@@ -576,3 +576,54 @@ def test_t01_source_audit_changes_reject_same_path_reuse(tmp_path, monkeypatch, 
     with pytest.raises(ValueError, match="request changed"):
         generate.generate(out, config, source)
     assert shared.files_identity(out) == before
+
+
+def test_migrated_source_and_result_roots():
+    assert shared.ROOT == shared.PROJECT / "main"
+    assert shared.RESULTS_ROOT == shared.PROJECT / "experiments/main"
+    assert shared.DEFAULT_SOURCE == shared.PROJECT / "experiments/preresearch/03_main/20261111-044057_four_conditions"
+    assert protocol.run_root(shared.RESULTS_ROOT / "runs/new") == shared.RESULTS_ROOT / "runs/new"
+    assert shared.code_identity()["main"]["shared.py"] == shared.file_hash(shared.ROOT / "shared.py")
+
+
+@pytest.mark.parametrize("relative", ["datasets/bad", "runs/bad"])
+def test_source_tree_cannot_receive_generated_results(relative):
+    target = shared.ROOT / relative
+    config = {"tasks": ["G01"], "episodes": 1, "val_episodes": 1, "test_scenes": 1, "seed": 1, "max_attempts": 100}
+    assert not target.exists()
+    with pytest.raises(ValueError, match="overlaps"):
+        generate.generate(target, config, dry_run=True)
+    with pytest.raises(ValueError, match="overlaps"):
+        protocol.run_root(target)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("script", ["generate_data.sh", "run_main.sh"])
+def test_migrated_shell_entry_from_unrelated_directory(tmp_path, script):
+    import os, sys
+    env = {**os.environ, "PY": sys.executable, "PYTHONDONTWRITEBYTECODE": "1", "CUDA_VISIBLE_DEVICES": ""}
+    result = subprocess.run(["bash", str(shared.ROOT / script), "--help"], cwd=tmp_path,
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "--" in result.stdout
+
+
+def test_migrated_cpu_queue_launches_real_new_package(study, monkeypatch):
+    out, p, rows = study
+    row = rows[0]
+    calls = []
+    real_popen = queue.subprocess.Popen
+    def launch(command, **kwargs):
+        calls.append(command)
+        return real_popen(command, **kwargs)
+    monkeypatch.setattr(queue.subprocess, "Popen", launch)
+    assert queue.run_job(out, p, row, "cpu", False, Event(), .1)
+    assert [command[2] for command in calls] == ["main.training.train", "main.evaluation.evaluate"]
+    folder = out / "train" / row["id"]
+    train.validate_done(folder, p, row)
+    for task in row["tasks"]:
+        evaluate.validate_eval(folder, p, row, task)
+    before = shared.files_identity(folder)
+    assert queue.run_job(out, p, row, "cpu", True, Event(), .1)
+    assert len(calls) == 2
+    assert shared.files_identity(folder) == before

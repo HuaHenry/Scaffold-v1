@@ -6,14 +6,16 @@
 
 ## 入口
 
-在 `experiments/main` 用 `bash generate_data.sh --help` 查看全部参数。从项目根目录可直接：
+在源码目录 `main` 用 `bash generate_data.sh --help` 查看全部参数。从项目根目录可直接：
 
 ```bash
-python -m experiments.main.data.generate --help
-python -m experiments.main.data.audit --data /路径/冻结数据版本
+python -m main.data.generate --help
+python -m main.data.audit --data /路径/冻结数据版本
 ```
 
 `--episodes`必填，`--tasks all`默认17任务；`--val-episodes`默认32，与当前03真实完整验证集一致；新任务 `--test-scenes`默认128，`--seed`默认20261113，`--workers`默认1。T01测试保留全部512场景，`--test-scenes`不截断它。训练/验证上限读取实际NPZ数组头，不使用旧summary的陈旧shape字段。
+
+数据结果建议写入 `experiments/main/datasets/<版本>/`；整个 `main/` 为源码树，禁止数据或训练结果写入。
 
 ## 数据版本结构
 

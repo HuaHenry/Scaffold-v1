@@ -38,7 +38,7 @@ def run_job(run, p, row, card, evaluate_only, stop, interval):
     elif evaluate_only:
         raise ValueError("evaluate-only cannot train a missing checkpoint")
     else:
-        stages.append(("train", "experiments.main.training.train"))
+        stages.append(("train", "main.training.train"))
     complete = True
     for task in row["tasks"]:
         if (out / "eval" / task / "complete.json").exists():
@@ -46,7 +46,7 @@ def run_job(run, p, row, card, evaluate_only, stop, interval):
         else:
             complete = False
     if not complete:
-        stages.append(("eval", "experiments.main.evaluation.evaluate"))
+        stages.append(("eval", "main.evaluation.evaluate"))
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="" if card == "cpu" else card,
                PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1")
     out.mkdir(parents=True, exist_ok=True)

@@ -1,7 +1,7 @@
 """Explicitly freeze settings selected on the anchor, then build single/mixed jobs."""
 from pathlib import Path
 
-from ..shared import (CONDITIONS, ROOT, TRAIN_DEFAULTS, VERSION, code_identity, digest, disjoint,
+from ..shared import (CONDITIONS, ROOT, RESULTS_ROOT, TRAIN_DEFAULTS, VERSION, code_identity, digest, disjoint,
                       file_hash, frozen_write, integer, load_json, name, ratio, safe_path, write_json)
 from ..data.audit import verify
 from ..tasks.registry import select
@@ -66,11 +66,7 @@ def jobs(protocol):
 
 
 def run_root(value):
-    out = safe_path(value)
-    if out == ROOT or out in ROOT.parents:
-        raise ValueError("run output must not contain source code")
-    disjoint(out, [ROOT / p for p in ("data", "tasks", "training", "evaluation", "tests", "extensions", "datasets")])
-    return out
+    return disjoint(value, [ROOT, RESULTS_ROOT / "datasets"])
 
 
 def prepare(out, protocol, manifest):

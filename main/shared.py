@@ -12,7 +12,8 @@ import sys
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
-PROJECT = ROOT.parents[1]
+PROJECT = ROOT.parent
+RESULTS_ROOT = PROJECT / "experiments/main"
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 PILOT = "preresearch.01_pilot_validity.exp"
