@@ -4,7 +4,7 @@ from pathlib import Path
 
 from ..shared import lock, load_json
 from ..data.audit import verify
-from .protocol import make_protocol, prepare, run_root, verify_run
+from .protocol import make_protocol, prepare, run_root, single_training_seed, verify_run
 from .queue import devices, execute, preflight
 
 
@@ -18,7 +18,7 @@ def main(argv=None):
     ap.add_argument("--formation-ratio")
     ap.add_argument("--selection-note", default="")
     ap.add_argument("--steps", type=int, help="prepare only; default94400")
-    ap.add_argument("--seeds", help="prepare only; default0,1,2")
+    ap.add_argument("--seeds", help="prepare only; exactly one training seed, default0")
     ap.add_argument("--modes", choices=("single", "mixed", "both"), help="prepare only; default both")
     ap.add_argument("--mixed-budget", choices=("per_task", "total"), help="prepare only; default per_task")
     ap.add_argument("--gpus", default="0,1,2,3")
@@ -32,11 +32,12 @@ def main(argv=None):
     if a.stage == "prepare":
         if a.data is None or a.episodes is None or a.formation_ratio is None:
             ap.error("prepare requires --data --episodes --formation-ratio and --selection-note")
+        seeds = single_training_seed(("0" if a.seeds is None else a.seeds).split(","))
         manifest = verify(a.data)
         modes = a.modes or "both"
         p = make_protocol(manifest, a.data, a.tasks or "all", a.episodes, a.formation_ratio,
                           a.steps if a.steps is not None else 94400,
-                          (a.seeds or "0,1,2").split(","), ("single", "mixed") if modes == "both" else (modes,),
+                          seeds, ("single", "mixed") if modes == "both" else (modes,),
                           a.mixed_budget or "per_task", selection_note=a.selection_note)
         from ..shared import disjoint
         disjoint(out, [a.data])

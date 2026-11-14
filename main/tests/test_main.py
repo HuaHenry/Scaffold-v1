@@ -193,14 +193,16 @@ def test_jobs_include_single_and_mixed_four_conditions(study):
     assert not (out / "train").exists()
 
 
-def test_seventeen_tasks_have_216_default_three_seed_jobs(generated):
+def test_seventeen_tasks_have_72_default_single_seed_jobs(generated):
     manifest = audit.verify(generated)
     manifest["tasks"] = registry.TASKS
     manifest["task_data"] = {t: {"train_episodes": 2} for t in registry.TASKS}
     p = protocol.make_protocol(manifest, generated, "all", 2, "0.4", selection_note="test")
     rows = protocol.jobs(p)
-    assert len(rows) == 216 and len({r["id"] for r in rows}) == 216
-    assert sum(r["mode"] == "mixed" for r in rows) == 12
+    assert p["training_seeds"] == [0]
+    assert len(rows) == 72 and len({r["id"] for r in rows}) == 72
+    assert sum(r["mode"] == "mixed" for r in rows) == 4
+    assert {r["seed"] for r in rows} == {0}
 
 
 @pytest.mark.parametrize("r", [0, 1, -1, "nan", "inf", 2])
@@ -306,7 +308,8 @@ def test_shared_metrics_perfect_and_empty_change():
 
 def test_paired_statistics_seed_std_and_task_macro(generated, tmp_path):
     manifest = audit.verify(generated)
-    p = protocol.make_protocol(manifest, generated, "all", 2, "0.4", seeds=(0, 1, 2), selection_note="test")
+    p = protocol.make_protocol(manifest, generated, "all", 2, "0.4", selection_note="test")
+    p["training_seeds"] = [0, 1, 2]
     samples = {}
     for mode in p["modes"]:
         for task in p["tasks"]:
@@ -337,7 +340,7 @@ def test_missing_scores_not_treated_as_zero(generated):
 def test_prepare_cli_and_resume_parameter_rejection(generated, tmp_path):
     out = tmp_path / "cli-run"
     args = ["--stage", "prepare", "--run", str(out), "--data", str(generated), "--episodes", "2",
-            "--formation-ratio", "0.4", "--selection-note", "test fixture", "--seeds", "0"]
+            "--formation-ratio", "0.4", "--selection-note", "test fixture"]
     main.main(args + ["--dry-run"])
     assert not out.exists()
     main.main(args)
@@ -627,3 +630,54 @@ def test_migrated_cpu_queue_launches_real_new_package(study, monkeypatch):
     assert queue.run_job(out, p, row, "cpu", True, Event(), .1)
     assert len(calls) == 2
     assert shared.files_identity(folder) == before
+
+
+@pytest.mark.parametrize("seeds", [(), (0, 1), (0, 1, 2), (0, 0), (-1,), (True,)])
+def test_main_training_rejects_invalid_or_multiple_seeds(generated, tmp_path, seeds):
+    manifest = audit.verify(generated)
+    with pytest.raises(ValueError):
+        protocol.make_protocol(manifest, generated, "all", 2, "0.4", seeds=seeds, selection_note="test")
+    p = protocol.make_protocol(manifest, generated, "all", 2, "0.4", selection_note="test")
+    row = protocol.jobs(p)[0]
+    p["training_seeds"] = list(seeds)
+    with pytest.raises(ValueError):
+        protocol.jobs(p)
+    run = tmp_path / "blocked"
+    with pytest.raises(ValueError):
+        protocol.prepare(run, p, manifest)
+    with pytest.raises(ValueError):
+        train.train_job(run, p, row, "cpu")
+    assert not run.exists()
+
+
+def test_main_prepare_defaults_to_seed_zero_and_accepts_one_other_seed(generated, tmp_path):
+    run = tmp_path / "default"
+    main.main(["--stage", "prepare", "--run", str(run), "--data", str(generated), "--episodes", "2",
+               "--formation-ratio", "0.4", "--selection-note", "test fixture"])
+    p = shared.load_json(run / "protocol.json")
+    rows = shared.load_json(run / "jobs.json")
+    assert p["training_seeds"] == [0] and len(rows) == 12 and {r["seed"] for r in rows} == {0}
+    other = protocol.make_protocol(audit.verify(generated), generated, "all", 2, "0.4", seeds=(7,), selection_note="test")
+    assert {r["seed"] for r in protocol.jobs(other)} == {7}
+    with pytest.raises(ValueError, match="job seed differs"):
+        train.train_job(tmp_path / "wrong-job", other, rows[0], "cpu")
+    assert not (tmp_path / "wrong-job").exists()
+
+
+@pytest.mark.parametrize("seeds", ["0,1", "0,1,2", ""])
+def test_cli_rejects_multiseed_before_reading_data(tmp_path, monkeypatch, seeds):
+    monkeypatch.setattr(main, "verify", lambda *a: pytest.fail("invalid seed read dataset"))
+    with pytest.raises(ValueError):
+        main.main(["--stage", "prepare", "--run", str(tmp_path / "blocked"), "--data", str(tmp_path / "missing"),
+                   "--episodes", "2", "--formation-ratio", "0.4", "--selection-note", "test", "--seeds", seeds])
+    assert not (tmp_path / "blocked").exists()
+
+
+def test_frozen_multiseed_run_rejected_before_dataset_access(study, monkeypatch):
+    out, p, _ = study
+    p = deepcopy(p)
+    p["training_seeds"] = [0, 1, 2]
+    shared.write_json(out / "protocol.json", p)
+    monkeypatch.setattr(protocol, "verify", lambda *a, **k: pytest.fail("multiseed resume read dataset"))
+    with pytest.raises(ValueError, match="exactly one"):
+        protocol.verify_run(out)

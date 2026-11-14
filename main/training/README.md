@@ -6,7 +6,7 @@
 - `train.py`：公共GridFormer和加权CE，保存最后原模型及EMA。
 - `queue.py`：独立GPU任务并行、日志进度、失败标记、纯评测全量预检。
 
-从源码目录 `main` 执行 `bash run_main.sh --help`；数据生成必须已经单独完成。prepare必填 `--data --run --episodes --formation-ratio --selection-note`。其余默认seeds0,1,2、steps94400、modes both、mixed-budget per_task。
+从源码目录 `main` 执行 `bash run_main.sh --help`；数据生成必须已经单独完成。prepare必填 `--data --run --episodes --formation-ratio --selection-note`。其余默认仅训练种子0、steps94400、modes both、mixed-budget per_task。无需传 `--seeds`；显式指定时也只能给一个非负种子，多个种子会在启动任务前拒绝。
 
 `process/shuffle`按相同R抽样；state/partial仅操作。形成转移1～31；混合操作转移33～39、41～47、49～55、57～63，保留shuffle乱序转移。R需严格在0～1之间。
 

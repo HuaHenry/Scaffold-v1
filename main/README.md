@@ -109,7 +109,7 @@ cd /data/huazhouqi/Scaffold-v1/Scaffold-v1/main
 bash run_main.sh --stage prepare --run "$RUN" --data "$DATA" \
   --episodes "$N" --formation-ratio "$R" \
   --selection-note "记录05/06或开发集如何选择N和R，并注明是否使用过T01测试成绩" \
-  --seeds 0,1,2 --modes both --mixed-budget per_task
+  --modes both --mixed-budget per_task
 ```
 
 可以加 `--dry-run`只读核验，不创建运行目录。
@@ -137,7 +137,7 @@ bash run_main.sh --stage prepare --run "$RUN" --data "$DATA" \
 
 任务份额按累计轮转配额均衡，各任务内部形成比例也使用累计整数配额。不能整批随机选一个任务导致长期份额不同。混训的学习率进度按它自身总更新数计算。
 
-17任务、四条件、三个种子、both：**204个单训模型＋12个混训模型＝216个模型**。单种子是68＋4＝72个模型。默认per_task混训每个模型1,604,800更新，资源量很大，建议先小规模核验。
+**默认只训练一个种子0，不需要传 `--seeds`。** 显式指定时也只允许一个非负种子，多种子配置会直接拒绝。17任务、四条件、both：**68个单训模型＋4个混训模型＝72个模型**。默认per_task混训每个模型1,604,800更新，资源量很大，建议先小规模核验。
 
 ## 7. 训练、纯评测和分析
 

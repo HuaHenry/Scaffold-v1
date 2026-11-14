@@ -7,7 +7,14 @@ from ..data.audit import verify
 from ..tasks.registry import select
 
 
-def make_protocol(manifest, data, tasks, episodes, formation_ratio, steps=94400, seeds=(0, 1, 2),
+def single_training_seed(seeds):
+    values = [integer(s, "training seed", 0) for s in seeds]
+    if len(values) != 1:
+        raise ValueError("main experiment requires exactly one training seed; default is 0")
+    return values
+
+
+def make_protocol(manifest, data, tasks, episodes, formation_ratio, steps=94400, seeds=(0,),
                   modes=("single", "mixed"), mixed_budget="per_task", overrides=None, selection_note=""):
     tasks = select(list(manifest["tasks"]) if tasks == "all" else tasks)
     if not set(tasks).issubset(manifest["tasks"]):
@@ -16,9 +23,7 @@ def make_protocol(manifest, data, tasks, episodes, formation_ratio, steps=94400,
     r = ratio(formation_ratio)
     if r in (0, 1):
         raise ValueError("four-condition main study requires 0 < formation ratio < 1; endpoints belong to ablations")
-    seeds = [integer(s, "training seed", 0) for s in seeds]
-    if not seeds or len(set(seeds)) != len(seeds) or seeds != sorted(seeds):
-        raise ValueError("training seeds must be distinct and increasing")
+    seeds = single_training_seed(seeds)
     modes = list(modes)
     if not modes or len(set(modes)) != len(modes) or set(modes) - {"single", "mixed"}:
         raise ValueError("modes must select single and/or mixed")
@@ -50,6 +55,7 @@ def make_protocol(manifest, data, tasks, episodes, formation_ratio, steps=94400,
 
 
 def jobs(protocol):
+    seeds = single_training_seed(protocol["training_seeds"])
     rows = []
     tasks = protocol["tasks"]
     groups = [("single", [t]) for t in tasks] if "single" in protocol["modes"] else []
@@ -58,7 +64,7 @@ def jobs(protocol):
     for mode, group in groups:
         steps = protocol["steps_single"] * (len(group) if mode == "mixed" and protocol["mixed_budget"] == "per_task" else 1)
         for c in CONDITIONS:
-            for seed in protocol["training_seeds"]:
+            for seed in seeds:
                 key = f"{mode}_{group[0] if mode == 'single' else 'all'}_{c}_seed{seed}"
                 rows.append({"id": key, "mode": mode, "tasks": group, "condition": c,
                              "seed": seed, "steps": steps})
@@ -70,6 +76,7 @@ def run_root(value):
 
 
 def prepare(out, protocol, manifest):
+    single_training_seed(protocol["training_seeds"])
     out = run_root(out)
     disjoint(out, [protocol["data"]])
     if out.exists() and not (out / "protocol.json").exists():
@@ -85,6 +92,7 @@ def prepare(out, protocol, manifest):
 def verify_run(out, full_data=True):
     out = run_root(out)
     p = load_json(out / "protocol.json")
+    single_training_seed(p["training_seeds"])
     disjoint(out, [p["data"]])
     manifest = verify(p["data"], full=full_data)
     if (file_hash(Path(p["data"]) / "manifest.json") != p["data_manifest_sha256"]

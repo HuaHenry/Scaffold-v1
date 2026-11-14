@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from ..shared import file_hash, frozen_write, load_json, lock, model_api, quota, train_api, write_json, common
-from .protocol import task_inputs, verify_run
+from .protocol import single_training_seed, task_inputs, verify_run
 from .sampler import Sampler, STATE_OPERATION
 
 
@@ -70,6 +70,9 @@ def validate_done(out, p, row):
 
 
 def train_job(run, p, row, device="auto"):
+    seeds = single_training_seed(p["training_seeds"])
+    if row["seed"] != seeds[0]:
+        raise ValueError("job seed differs from the single recorded training seed")
     out = Path(run) / "train" / row["id"]
     task_inputs(p, row)
     if (out / "train_complete.json").exists():
