@@ -1,8 +1,74 @@
 # 多任务主实验
 
-这里只实现主实验03的扩展：**每个任务分别训练四条件模型，再将所有任务混训四条件模型**。单任务结果是核心证据，混训为补充，不把跨任务迁移作为验证目标。
+这里只实现主实验03的扩展。**当前正式执行精简为5个代表任务：T01、W01、W02、G03、G07，只分别训练四条件模型，全部seed0，共20个模型。** 完整17任务及混训仍作为可选功能保留，不进入本次五任务队列。
 
-数据生成和训练完全分开。形成比例与每任务数据量必须显式传入，并记录05/06或开发集的选择依据；没有替你预设最终最优setting。
+数据生成和训练完全分开。当前每任务使用前10,240集、每模型94,400步、batch256、形成比例0.4、最终EMA；属于固定step、有放回抽样方案，不称为完整训练5轮。设置继承原运行的冻结协议，05/06选择依据保留。
+
+## 当前五任务版：复制已完成模型，继续训练剩余模型
+
+| 类型 | 任务 | 当前迁移时状态 |
+|---|---|---|
+| 结构干预 | T01：原结构基准 | 四条件训练、评测已完成，复制复用 |
+| 简单平地 | W01：平地落水 | 四条件训练、评测已完成，复制复用 |
+| 容器释放 | W02：容器侧壁放水 | 四条件训练、评测已完成，复制复用 |
+| 坡面运动 | G03：坡面移沙 | 四条件需要新训练 |
+| 狭缝释放 | G07：狭缝落沙 | 四条件需要新训练 |
+
+按任务内容和计算预算选代表任务，不按测试分数筛选。结构、水、沙均有覆盖，但不宣称覆盖全部地形。17任务的数据保留，不重新生成、不删除。原运行已停止，当前可复制 **12个已完成模型及其第32步评测**，只新训练 **8个模型**。以后完成数以 `--stage status` 为准。
+
+### 为什么用专用入口
+
+新入口为 `main/run_subset.sh`，实现位于 `scripts/main_subset.py`。单训模型只依赖本任务数据及设置，因此缩小汇总任务集合不会改变其训练语义；混训模型不适用这种复用。
+
+模型的 `config.json`、`done.json`、`ckpt.pt`、`train_complete.json`、已完成评测全部普通复制，原字节和原哈希不变，不用符号链接或硬链接，不修改旧目录。新目录中 `protocol.json`、`jobs.json`、`run.json` **逐字节保留原17任务训练协议快照**，用于验证模型原身份；它们不是五任务执行清单。
+
+**实际五任务执行清单与复制来源在 `subset.json`，由 `subset_complete.json` 冻结。专用入口只执行其中20个单训模型，分析只纳入这5个任务。** 不改旧Python训练源码或数据身份，避免引入兼容性绕过。入口自身的源码哈希也冻结，之后修改入口需新建运行或保留对应版本。
+
+**不要对五任务目标目录运行 `main/run_main.sh` 或直接调用 `main.training.main`。** 原完整入口读的是17任务快照，可能排队68个模型；shell入口现在会拒绝子集目录并提示改用专用入口。训练与分析均使用下面的 `run_subset.sh`。
+
+### 第一步：迁移准备（只复制，不启动GPU训练）
+
+项目根目录执行：
+
+```bash
+cd /data/huazhouqi/Scaffold-v1/Scaffold-v1
+export PY=/usr/bin/python3
+export OLD_RUN=/data/huazhouqi/Scaffold-v1/Scaffold-v1/experiments/main/runs/main_single_n10240_r04_seed0_v1
+export RUN=/data/huazhouqi/Scaffold-v1/Scaffold-v1/experiments/main/runs/main_five_n10240_r04_seed0_v1
+
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 \
+  bash main/run_subset.sh --stage prepare --source-run "$OLD_RUN" --run "$RUN" \
+  --tasks T01,W01,W02,G03,G07
+```
+
+准备会核验源数据和模型，普通复制已完成训练及已完成评测；未完成训练目录、未提交评测、失败记录不复制。复制中断可用同一命令继续，目标文件不匹配会拒绝，不自动覆盖损坏结果。已有成功迁移可幂等核验。源流水线或相关训练/评测锁仍被占用时拒绝迁移。
+
+本次代理已执行上述准备并验证后，你无需再准备，直接执行下一步。
+
+### 第二步：真正启动训练（只新训缺失模型）
+
+```bash
+PY=/usr/bin/python3 bash /data/huazhouqi/Scaffold-v1/Scaffold-v1/main/run_subset.sh \
+  --stage train \
+  --run /data/huazhouqi/Scaffold-v1/Scaffold-v1/experiments/main/runs/main_five_n10240_r04_seed0_v1 \
+  --gpus 0,1,2,3 --progress-every 30
+```
+
+**这一条才启动GPU训练。** 已完成的12个模型和评测通过校验后直接跳过；只训练G03、G07的8个模型，每卡一个模型，训练结束自动评测。若之后停止并再执行同一命令，已提交模型仍跳过；被强停且无完成标记的模型从step0重训，不恢复优化器。不会启动其他12个任务，不启动混训，也不会重新生成数据。
+
+按当前main每模型约4.3～4.4小时，8个新模型四卡约两批，**纯训练参考约8.6～8.8小时**，另加数据核验、加载、验证和评测；不同任务速度可能变化，不承诺精确结束时间。降低N没有减少94,400更新预算。
+
+### 查看状态、纯评测、五任务分析
+
+```bash
+PY=/usr/bin/python3 bash main/run_subset.sh --stage status --run "$RUN"
+PY=/usr/bin/python3 bash main/run_subset.sh --stage evaluate --run "$RUN" --gpus 0,1,2,3
+PY=/usr/bin/python3 bash main/run_subset.sh --stage analyze --run "$RUN" --boot 10000 --bootstrap-seed 12345
+```
+
+`status`显示20格完成数及剩余训练数。纯评测先检查选中20个最终模型，缺失就停止，不启动训练。分析也要求所有选中模型/评测齐全，输出 `analysis/subset_boot10000_seed12345/` 的 `results.json`、`results.md` 与PNG/PDF图；后续重复分析使用新后缀目录。报告记录原协议、复制来源、五任务分析视图和完整身份，不将旧17任务平均值沿用为5任务结果。
+
+下面各节描述完整任务注册、数据接口及原完整运行方式；当前执行以上五任务命令即可。
 
 ## 1. 目录结构
 
