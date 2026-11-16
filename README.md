@@ -1,1 +1,1 @@
-# Scaffold-v1: Closing the Formation Gap in World Models with Construction Trajectories	
+# Scaffold-v1: Formation-Supervised Physical World Models for 2D Games
